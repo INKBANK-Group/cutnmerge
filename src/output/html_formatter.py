@@ -2787,6 +2787,224 @@ _HEADER_SUBCOL_CODE_RE = re.compile(
     r"摩尔[%％]"
     r")$"
 )
+_LETTERED_PARENT_HDR_RE = re.compile(
+    r"[\(（]\s*([a-zA-Zα-ωΑ-Ω])\s*[\)）]"
+)
+_LETTERED_CHILD_HDR_RE = re.compile(
+    r"[\(（]\s*([a-zA-Zα-ωΑ-Ω])\s*\d"
+)
+_GENERIC_SUBHDR_RE = re.compile(r"^其他$")
+
+
+def _refresh_cell_spans(cell: Dict[str, Any]) -> None:
+    cell["row_span"] = int(cell["row_end"]) - int(cell["row_start"]) + 1
+    cell["col_span"] = int(cell["col_end"]) - int(cell["col_start"]) + 1
+
+
+def _lettered_parent_letter(text: str) -> Optional[str]:
+    m = _LETTERED_PARENT_HDR_RE.search("".join((text or "").split()))
+    return m.group(1).lower() if m else None
+
+
+def _lettered_child_letter(text: str) -> Optional[str]:
+    m = _LETTERED_CHILD_HDR_RE.search("".join((text or "").split()))
+    return m.group(1).lower() if m else None
+
+
+def _atomic_header_at(
+    cells: Sequence[Dict[str, Any]], row: int, col: int
+) -> Optional[Dict[str, Any]]:
+    for c in cells:
+        if (
+            int(c["row_start"]) == int(c["row_end"]) == row
+            and int(c["col_start"]) == int(c["col_end"]) == col
+        ):
+            return c
+    return None
+
+
+def _row_col_header_label(cells: Sequence[Dict[str, Any]], row: int, col: int) -> str:
+    cell = _atomic_header_at(cells, row, col)
+    if cell is None:
+        return ""
+    return str(cell.get("text") or "").strip()
+
+
+def _column_gap_between_subheaders(
+    cells: Sequence[Dict[str, Any]],
+    row: int,
+    col: int,
+    *,
+    header_end: int,
+) -> bool:
+    """本列下方无格，但左右邻列同层已有表头 → 父级 colspan 占位，勿纵向合并。"""
+    if row > header_end or col < 0:
+        return False
+    left = _row_col_header_label(cells, row, col - 1)
+    right = _row_col_header_label(cells, row, col + 1)
+    if not left or not right:
+        return False
+    return not (
+        _is_cell_frag(left)
+        or _is_cell_frag(right)
+        or _is_header_unit_line(left)
+        or _is_header_unit_line(right)
+    )
+
+
+def _child_cols_for_lettered_parent(
+    cells: Sequence[Dict[str, Any]],
+    *,
+    parent_letter: str,
+    bottom_row: int,
+    max_col: int,
+) -> List[int]:
+    """下层子列：同字母 (a1…) 及紧邻的「其他」等通用子头，止于下一字母父头列。"""
+    child_cols: List[int] = []
+    pl = parent_letter.lower()
+    for col in range(max_col + 1):
+        text = _row_col_header_label(cells, bottom_row, col)
+        if not text:
+            continue
+        compact = "".join(text.split())
+        child_letter = _lettered_child_letter(text)
+        if child_letter == pl:
+            child_cols.append(col)
+            continue
+        if child_cols and _GENERIC_SUBHDR_RE.fullmatch(compact):
+            child_cols.append(col)
+            continue
+        if child_cols:
+            other_parent = _lettered_parent_letter(text)
+            if other_parent and other_parent != pl:
+                break
+            if other_parent == pl:
+                child_cols.append(col)
+                continue
+            break
+    return child_cols
+
+
+def _compact_logic_columns(
+    cells: List[Dict[str, Any]], drop_cols: Set[int]
+) -> List[Dict[str, Any]]:
+    """删除表头子列之间的幽灵逻辑列并重映射 col_*。"""
+    if not drop_cols:
+        return cells
+    max_col = max(int(c["col_end"]) for c in cells)
+    remap = {}
+    new_c = 0
+    for old_c in range(max_col + 1):
+        if old_c in drop_cols:
+            continue
+        remap[old_c] = new_c
+        new_c += 1
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        nc = dict(c)
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        new_idxs = [remap[i] for i in range(cs, ce + 1) if i in remap]
+        if not new_idxs:
+            continue
+        nc["col_start"] = min(new_idxs)
+        nc["col_end"] = max(new_idxs)
+        _refresh_cell_spans(nc)
+        out.append(nc)
+    return out
+
+
+def _normalize_tiered_column_headers(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    字母分级表头：(a) 父头跨 (a1…)/其他 子列；无子列的 (b)/清漆/溶剂 等纵向跨表头带。
+
+    修复 TSR 把父头放在子列间隙、或 `_merge_header_empty_below` 误扩 rowspan 的情况。
+    """
+    if not cells:
+        return cells
+
+    header_end = _top_header_band_end(cells)
+    if header_end < 1:
+        return cells
+
+    top_row = 0
+    bottom_row = header_end
+    max_col = max(int(c["col_end"]) for c in cells)
+
+    parent_cells: List[Dict[str, Any]] = []
+    child_cols_union: Set[int] = set()
+    for c in cells:
+        if c.get("_drop_render"):
+            continue
+        letter = _lettered_parent_letter(str(c.get("text") or ""))
+        if not letter:
+            continue
+        child_cols = _child_cols_for_lettered_parent(
+            cells,
+            parent_letter=letter,
+            bottom_row=bottom_row,
+            max_col=max_col,
+        )
+        if not child_cols:
+            continue
+        parent_cells.append(c)
+        child_cols_union.update(child_cols)
+        c["row_start"] = top_row
+        c["row_end"] = top_row
+        c["col_start"] = min(child_cols)
+        c["col_end"] = max(child_cols)
+        _refresh_cell_spans(c)
+
+    if not parent_cells:
+        return cells
+
+    gap_cols: Set[int] = set()
+    if len(child_cols_union) >= 2:
+        lo, hi = min(child_cols_union), max(child_cols_union)
+        gap_cols = {col for col in range(lo + 1, hi) if col not in child_cols_union}
+    if gap_cols:
+        cells = _compact_logic_columns(cells, gap_cols)
+        child_cols_union = set()
+        for c in cells:
+            letter = _lettered_parent_letter(str(c.get("text") or ""))
+            if not letter:
+                continue
+            child_cols_union.update(
+                _child_cols_for_lettered_parent(
+                    cells,
+                    parent_letter=letter,
+                    bottom_row=bottom_row,
+                    max_col=max(int(x["col_end"]) for x in cells),
+                )
+            )
+
+    for c in cells:
+        if c.get("_drop_render"):
+            continue
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs = int(c["col_start"])
+        if rs != bottom_row or re != bottom_row:
+            continue
+        if cs in child_cols_union:
+            continue
+        text = str(c.get("text") or "").strip()
+        if not text or _is_cell_frag(text) or _is_header_unit_line(text):
+            continue
+        if _EXAMPLE_COL_HEADER_RE.search(text):
+            continue
+        if int(c.get("col_span") or 1) > 1:
+            continue
+        c["row_start"] = top_row
+        c["row_end"] = bottom_row
+        _refresh_cell_spans(c)
+
+    logger.info(
+        "分级列头归位: %d 个字母父头, 子列 %s",
+        len(parent_cells),
+        sorted(child_cols_union),
+    )
+    return cells
 
 
 def _is_stacked_header_label(text: str) -> bool:
@@ -2928,6 +3146,14 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
             # 下方没有 cell 对象时，renderer 会输出空 td；若没有任何非空 cell 占用该区域，则直接扩展 upper rowspan
             next_row = ue + 1
             if not _occupied_by_nonempty(next_row, uc_s, uc_e):
+                if _column_gap_between_subheaders(
+                    cells, next_row, uc_s, header_end=header_end
+                ):
+                    out.append(upper)
+                    continue
+                if _lettered_parent_letter(upper_text):
+                    out.append(upper)
+                    continue
                 upper["row_end"] = next_row
                 upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
             out.append(upper)
@@ -3042,6 +3268,7 @@ def cells_to_html_table(
         work = compress_empty_logic_rows(work)
     work = _split_mismerged_unit_rowspans(work)
     work = _merge_header_unit_rows(work)
+    work = _normalize_tiered_column_headers(work)
     work = _merge_header_empty_below(work)
     work = [c for c in work if not c.get("_drop_render")]
     if not work:
