@@ -687,6 +687,7 @@ def _extract_via_tsr(
         clip_row_header_child_overlaps,
         extend_section_rowspan_over_metric_rows,
         peel_row_header_text,
+        repair_component_section_rowspans,
     )
 
     transposed = False
@@ -728,6 +729,7 @@ def _extract_via_tsr(
     cells = upgrade_o_to_double_circle(cells, binary)
     cells = peel_row_header_text(cells, text_boxes)
     cells = extend_section_rowspan_over_metric_rows(cells)
+    cells = repair_component_section_rowspans(cells)
     cells, caption_texts = strip_caption_cells(cells)
     if caption_texts:
         free_texts.extend(caption_texts)
@@ -743,6 +745,8 @@ def _extract_via_tsr(
     cells = refill_truncated_monomer_child_headers_from_ocr(cells, text_boxes)
     cells = split_left_anchor_subheader_leak(cells)
     cells = split_undersplit_monomer_child_headers(cells)
+    # 切分/补字后再吸收空槽，避免把还能从 OCR 填上的子头列并掉
+    cells = absorb_empty_child_header_gaps(cells)
     cells = sanitize_side_header_texts(cells)
     cells = recover_empty_vertical_headers(
         image,

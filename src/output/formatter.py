@@ -132,7 +132,21 @@ def split_cells_into_subtables(
 
     subtables: List[List[Dict[str, Any]]] = []
     for row_lo, row_hi in segments:
-        group = [c for c in cells if row_lo <= int(c["row_start"]) <= row_hi]
+        group: List[Dict[str, Any]] = []
+        for c in cells:
+            rs, re = int(c["row_start"]), int(c["row_end"])
+            if re < row_lo or rs > row_hi:
+                continue
+            nc = dict(c)
+            clip_start = max(rs, row_lo)
+            clip_end = min(re, row_hi)
+            nc["row_start"] = clip_start
+            nc["row_end"] = clip_end
+            nc["row_span"] = clip_end - clip_start + 1
+            if rs < row_lo:
+                # rowspan 从上一段延续：本子表只保留占位，文本留在 origin 段
+                nc["text"] = ""
+            group.append(nc)
         if not group:
             continue
         # 过滤全空子表（所有单元格无文本内容）

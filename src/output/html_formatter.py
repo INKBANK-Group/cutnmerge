@@ -2454,12 +2454,30 @@ _HEADER_HAS_EXAMPLE_RE = re.compile(r"实[施試]例|実[施試]例|比較例|�
 _HEADER_UNIT_RE = re.compile(
     r"^[\(（][\w%°℃²³/\s\.\-μ]+[\)）]$"
 )
+# 括号内须含典型单位特征，避免 (B-2)/(D) 等编号被当成 (mN)/(℃)
+_HEADER_UNIT_INNER_RE = re.compile(
+    r"[%°℃²³/μ]|"
+    r"(?:mJ|cm|mm|μm|min|mol|wt|vol|hr|mN|kPa|MPa)|"
+    r"^\d+$",
+    re.I,
+)
 
 
 def _is_header_unit_line(text: str) -> bool:
     """括号包裹的纯单位文本，如 (mJ/cm2)、(mN)、(%)、(℃)。"""
     t = "".join((text or "").split())
-    return bool(t) and bool(_HEADER_UNIT_RE.fullmatch(t))
+    if not t or not _HEADER_UNIT_RE.fullmatch(t):
+        return False
+    inner = t[1:-1] if t[0] in "(（" else t
+    if re.fullmatch(r"[A-Za-z]-?\d+", inner):
+        return False
+    if re.fullmatch(r"[A-Z]", inner):
+        return False
+    if _HEADER_UNIT_INNER_RE.search(inner):
+        return True
+    if re.fullmatch(r"[A-Za-z]{1,4}", inner) and not re.search(r"\d", inner):
+        return True
+    return False
 
 
 def _row_is_unit_subheader(cells: Sequence[Dict[str, Any]], row: int) -> bool:
@@ -2675,9 +2693,13 @@ def _header_cell_above(
 
 def _split_mismerged_unit_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """单位格被误扩 rowspan 时收回单行，避免 P29 单位行错位。"""
+    header_end = _top_header_band_end(cells)
     for c in cells:
         rs, re = int(c["row_start"]), int(c["row_end"])
         if re <= rs:
+            continue
+        # 仅表头带内处理；表体子标签 (B-2) 等 rowspan 不得拆
+        if rs > header_end:
             continue
         if _is_header_unit_line(str(c.get("text") or "")):
             c["row_end"] = rs
@@ -2809,6 +2831,52 @@ def _lettered_parent_letter(text: str) -> Optional[str]:
 def _lettered_child_letter(text: str) -> Optional[str]:
     m = _LETTERED_CHILD_HDR_RE.search("".join((text or "").split()))
     return m.group(1).lower() if m else None
+
+
+def _split_lettered_parent_child_text(text: str) -> Tuple[str, str]:
+    """字母父头格若吞入同字母子头 (a1…)，拆成父/子两段文本。"""
+    raw = (text or "").strip()
+    if not raw:
+        return raw, ""
+    pl = _lettered_parent_letter(raw)
+    if not pl:
+        return raw, ""
+    lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    if len(lines) >= 2:
+        child_idx: Optional[int] = None
+        for i, ln in enumerate(lines):
+            if i == 0:
+                continue
+            cl = _lettered_child_letter(ln)
+            if cl == pl:
+                child_idx = i
+                break
+        if child_idx is not None:
+            parent = "\n".join(lines[:child_idx]).strip()
+            child = "\n".join(lines[child_idx:]).strip()
+            if parent and child:
+                return parent, child
+    compact = "".join(raw.split())
+    m_parent = _LETTERED_PARENT_HDR_RE.search(compact)
+    m_child = _LETTERED_CHILD_HDR_RE.search(compact)
+    if (
+        m_parent
+        and m_child
+        and m_child.start() > m_parent.start()
+        and m_child.group(1).lower() == pl
+    ):
+        # 按 compact 偏移映回原文（去空白对齐）
+        ci = 0
+        split_at = 0
+        for ch in raw:
+            if not ch.isspace():
+                if ci == m_child.start():
+                    split_at = raw.index(ch, split_at)
+                    break
+                ci += 1
+        if split_at > 0:
+            return raw[:split_at].strip(), raw[split_at:].strip()
+    return raw, ""
 
 
 def _atomic_header_at(
@@ -2950,6 +3018,38 @@ def _normalize_tiered_column_headers(
             continue
         parent_cells.append(c)
         child_cols_union.update(child_cols)
+        parent_text, child_text = _split_lettered_parent_child_text(
+            str(c.get("text") or "")
+        )
+        if child_text:
+            c["text"] = parent_text
+            left_col = min(child_cols)
+            target = _atomic_header_at(cells, bottom_row, left_col)
+            if target is c:
+                target = None
+            if target is None:
+                bbox = _cell_physical_bbox_x_y(c)
+                new_c = _empty_atomic_from_bbox(
+                    c,
+                    left_col,
+                    int(c["col_start"]),
+                    int(c["col_end"]),
+                    bbox,
+                )
+                new_c["row_start"] = bottom_row
+                new_c["row_end"] = bottom_row
+                new_c["row_span"] = 1
+                new_c["text"] = child_text
+                cells.append(new_c)
+                logger.info(
+                    "分级列头: 子头文本归位 col %d ← %s",
+                    left_col,
+                    child_text[:24],
+                )
+            elif not str(target.get("text") or "").strip():
+                target["text"] = child_text
+            elif _lettered_child_letter(str(target.get("text") or "")) == letter:
+                target["text"] = child_text
         c["row_start"] = top_row
         c["row_end"] = top_row
         c["col_start"] = min(child_cols)
@@ -2995,6 +3095,13 @@ def _normalize_tiered_column_headers(
             continue
         if int(c.get("col_span") or 1) > 1:
             continue
+        top_label = _row_col_header_label(cells, top_row, cs)
+        if (
+            top_label
+            and _is_stacked_header_label(top_label)
+            and _is_stacked_header_label(text)
+        ):
+            continue
         c["row_start"] = top_row
         c["row_end"] = bottom_row
         _refresh_cell_spans(c)
@@ -3026,6 +3133,56 @@ def _is_stacked_header_label(text: str) -> bool:
     if _HEADER_SUBCOL_CODE_RE.fullmatch(compact):
         return False
     return bool(re.search(r"[\u4e00-\u9fff]", t))
+
+
+def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """表头带内 rowspan>1 且叠放独立中文标签 → 按行拆成上下两格（如添加剂/热产碱剂）。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 1:
+        return cells
+    work = list(cells)
+    added: List[Dict[str, Any]] = []
+    for c in work:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if re <= rs or re > header_end:
+            continue
+        if int(c["col_start"]) != int(c["col_end"]):
+            continue
+        if _lettered_parent_letter(str(c.get("text") or "")):
+            continue
+        parts = [p.strip() for p in str(c.get("text") or "").split("\n") if p.strip()]
+        if len(parts) < 2:
+            continue
+        if not all(_is_stacked_header_label(p) for p in parts):
+            continue
+        n_parts = min(len(parts), re - rs + 1)
+        if n_parts < 2:
+            continue
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        c["text"] = parts[0]
+        c["row_end"] = rs
+        _refresh_cell_spans(c)
+        bbox = _cell_physical_bbox_x_y(c)
+        pool = work + added
+        for i in range(1, n_parts):
+            row = rs + i
+            slot = _atomic_header_at(pool, row, cs)
+            if slot is not None and slot is not c:
+                if not str(slot.get("text") or "").strip():
+                    slot["text"] = parts[i]
+                continue
+            new_c = _empty_atomic_from_bbox(c, cs, cs, ce, bbox)
+            new_c["row_start"] = row
+            new_c["row_end"] = row
+            new_c["row_span"] = 1
+            new_c["text"] = parts[i]
+            added.append(new_c)
+    if added:
+        work.extend(added)
+        logger.info("split_stacked_header_rowspans: 拆 %d 格", len(added))
+    return work
 
 
 def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3165,6 +3322,16 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
                 _is_stacked_header_label(upper_text)
                 and _is_stacked_header_label(lower_text)
             ):
+                # 表头带顶/底两层独立标签（添加剂/热产碱剂）保持分列；
+                # P40 二苯基醚/二甲酰氯 在 colspan 父头下仍允许合并。
+                if (
+                    int(lower["row_start"]) == header_end
+                    and ur < header_end
+                    and int(lower["col_start"]) == uc_s
+                    and not under_colspan_parent
+                ):
+                    out.append(upper)
+                    continue
                 if under_colspan_parent:
                     out.append(upper)
                     continue
@@ -3269,6 +3436,7 @@ def cells_to_html_table(
     work = _split_mismerged_unit_rowspans(work)
     work = _merge_header_unit_rows(work)
     work = _normalize_tiered_column_headers(work)
+    work = _split_stacked_header_rowspans(work)
     work = _merge_header_empty_below(work)
     work = [c for c in work if not c.get("_drop_render")]
     if not work:

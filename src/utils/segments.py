@@ -23,9 +23,11 @@ _HEADER_CAPTION_RE = re.compile(
 _HEADER_JACCARD_THRESH = 0.28
 # 分段异形表：中段再出现「聚合物 / 单体[」等强表头信号时切开
 # 注意：不要用单独的「有机硅烷/酸当量」——子表头行也会命中，会把同一子表切碎
-_SECTION_HEADER_RE = re.compile(
-    r"(聚合物|单体\s*[\[［])"
+# 「形成聚合物时的 Tg」等表体计量行虽含「聚合物」但同行有多列数值，不得当作分段点
+_SECTION_HEADER_RAW_RE = re.compile(
+    r"(?<!形成)(?<!的)(?<!性)聚合物|单体\s*[\[［]"
 )
+_NUM_DATA_TOKEN_RE = re.compile(r"^[-–—−]?\d+(?:\.\d+)?$")
 _DATA_ROW_RE = re.compile(r"(合成例|实施例|実施例|比較例|比较例)\s*\d*")
 
 
@@ -51,6 +53,21 @@ def _jaccard(a: set, b: set) -> float:
     inter = len(a & b)
     union = len(a | b)
     return inter / union if union else 0.0
+
+
+def _row_is_midtable_section_header(joined: str) -> bool:
+    """本行是否为「聚合物 / 单体[」类中段分表头，而非表体计量/配方行。"""
+    s = (joined or "").strip()
+    if not s or not _SECTION_HEADER_RAW_RE.search(s):
+        return False
+    parts = s.split()
+    num_data = sum(
+        1 for p in parts if _NUM_DATA_TOKEN_RE.fullmatch(p.strip())
+    )
+    # 同行右侧多列数值 → 表体数据行（如 Tg=123 跨实施例列）
+    if num_data >= 3:
+        return False
+    return True
 
 
 def _cell_y_top(cell: Dict[str, Any]) -> float:
@@ -150,7 +167,7 @@ def find_row_segments(
         )
         toks = _tokenize_row_text(joined)
         is_data_row = bool(_DATA_ROW_RE.search(joined))
-        is_section_hdr = bool(_SECTION_HEADER_RE.search(joined))
+        is_section_hdr = _row_is_midtable_section_header(joined)
         is_caption = bool(_HEADER_CAPTION_RE.search(joined))
         should_split = False
         if seg_start is not None and prev_y_bot is not None:

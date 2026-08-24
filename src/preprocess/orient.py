@@ -165,18 +165,47 @@ def _mean_ocr_score(text_boxes: list) -> float:
 
 
 def _box_aspect_upright_ratio(text_boxes: list) -> float:
+    """按文本长度加权的横长框占比（长文本框权重更高，天然压制单字符干扰）。"""
     if not text_boxes:
         return 0.0
-    upright = 0
+    
+    total_weight = 0.0
+    upright_weight = 0.0
+    
     for tb in text_boxes:
         poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
         if poly.size < 4:
             continue
         w = float(poly[:, 0].max() - poly[:, 0].min())
         h = float(poly[:, 1].max() - poly[:, 1].min())
-        if w >= h * 0.9:
-            upright += 1
-    return upright / max(len(text_boxes), 1)
+        
+        # 权重取文本字符数（最小为 1，上限截断到 10 避免个别极长文本独占权重）
+        text_len = len(str(tb.get("text") or "").strip())
+        weight = max(1.0, min(float(text_len), 10.0))
+        
+        total_weight += weight
+        # 略放宽单框阈值：宽达到高的 0.85 即算横向
+        if w >= h * 0.85:
+            upright_weight += weight
+            
+    return (upright_weight / total_weight) if total_weight > 0 else 0.0
+
+
+def looks_sideways(text_boxes: list, *, score_thresh: float = 0.55) -> bool:
+    """OCR 结果是否像侧躺（基于加权横长框占比与置信度）。"""
+    if len(text_boxes) < 5:
+        return True
+    
+    aspect = _box_aspect_upright_ratio(text_boxes)
+    score = _mean_ocr_score(text_boxes)
+    
+    # 经过字符长度加权后，正常排版表格的 aspect 通常在 0.70 以上
+    # 真正侧躺的表格 aspect 通常会暴跌至 0.30 以下
+    if aspect < 0.50:
+        return True
+    if aspect < 0.65 and score < score_thresh:
+        return True
+    return False
 
 
 def parse_orientation_mode(mode: Union[str, int]) -> Union[str, int]:

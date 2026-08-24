@@ -1129,3 +1129,115 @@ def extend_section_rowspan_over_metric_rows(
     if not changed:
         return cells
     return [c for c in cells if not c.get("_drop_render")]
+
+
+_COMPONENT_SECTION_PARENT_RE = re.compile(
+    r"^[\(（][A-Za-z][\)）]\s*成分",
+    re.I,
+)
+_COMPONENT_SUBCATEGORY_RE = re.compile(
+    r"^(颜料|染料|树脂|单体|化合物|封端剂|二胺|酸酐)$"
+)
+
+
+def repair_component_section_rowspans(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    表体 (X)成分 大类 + 右列子类（颜料/染料…）：
+
+    1. 右列子类横线不贯通左列时，TSR 常在左列留下空续行 → 合并回父格 rowspan；
+    2. 同列相邻子类标签 rowspan 互斥，裁掉上方格对下方格的覆盖。
+    """
+    if not cells:
+        return cells
+
+    work = [dict(c) for c in cells]
+    dropped: set = set()
+    changed = 0
+
+    parents: List[Tuple[int, Dict[str, Any]]] = []
+    for c in work:
+        compact = re.sub(r"\s+", "", str(c.get("text") or ""))
+        if not _COMPONENT_SECTION_PARENT_RE.search(compact):
+            continue
+        if int(c["col_start"]) > 2:
+            continue
+        parents.append((int(c["row_start"]), c))
+    parents.sort(key=lambda x: x[0])
+
+    for _, parent in parents:
+        if id(parent) in dropped:
+            continue
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        if pcs != pce:
+            continue
+        parent_end = int(parent["row_end"])
+        scan = parent_end + 1
+        while scan <= max(int(c["row_end"]) for c in work):
+            cont: Optional[Dict[str, Any]] = None
+            blocked = False
+            for c in work:
+                if id(c) in dropped or c is parent:
+                    continue
+                if int(c["col_start"]) != pcs or int(c["col_end"]) != pce:
+                    continue
+                if int(c["row_start"]) > scan or int(c["row_end"]) < scan:
+                    continue
+                if str(c.get("text") or "").strip():
+                    blocked = True
+                    break
+                cont = c
+                break
+            if blocked or cont is None:
+                break
+            parent_end = int(cont["row_end"])
+            dropped.add(id(cont))
+            scan = parent_end + 1
+            changed += 1
+        if parent_end != int(parent["row_end"]):
+            parent["row_end"] = parent_end
+            _refresh_rowspan(parent)
+            logger.info(
+                "成分大类合并空续行: %s → row %d-%d",
+                str(parent.get("text") or "")[:16],
+                int(parent["row_start"]),
+                parent_end,
+            )
+
+    by_col: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+    for c in work:
+        if id(c) in dropped:
+            continue
+        compact = re.sub(r"\s+", "", str(c.get("text") or ""))
+        if not _COMPONENT_SUBCATEGORY_RE.fullmatch(compact):
+            continue
+        key = (int(c["col_start"]), int(c["col_end"]))
+        by_col.setdefault(key, []).append(c)
+
+    for group in by_col.values():
+        group.sort(key=lambda c: int(c["row_start"]))
+        for i in range(len(group) - 1):
+            upper, lower = group[i], group[i + 1]
+            u_end = int(upper["row_end"])
+            l_start = int(lower["row_start"])
+            if u_end < l_start:
+                continue
+            new_end = l_start - 1
+            if new_end < int(upper["row_start"]):
+                continue
+            if new_end != u_end:
+                upper["row_end"] = new_end
+                _refresh_rowspan(upper)
+                changed += 1
+                logger.info(
+                    "子类 rowspan 裁剪: %s row_end %d → %d（避让 %s）",
+                    str(upper.get("text") or "")[:8],
+                    u_end,
+                    new_end,
+                    str(lower.get("text") or "")[:8],
+                )
+
+    if not changed:
+        return cells
+    return [c for c in work if id(c) not in dropped]

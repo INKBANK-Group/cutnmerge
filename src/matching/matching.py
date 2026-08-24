@@ -2428,6 +2428,69 @@ def _cell_texts_on_col(cells: List[Dict[str, Any]], col: int) -> List[str]:
     return out
 
 
+_SINGLE_SAMPLE_LETTER_RE = re.compile(r"^[A-Z]$")
+
+
+def _row_is_sample_letter_header(cells: List[Dict[str, Any]], row: int) -> bool:
+    """列头行：J/K/L/M/N/O/P… 等连续大写字母，空位可能是 OCR 漏检而非评价符号。"""
+    letter_cols: List[int] = []
+    for c in cells:
+        rs = int(c.get("row_start") or 0)
+        re_ = int(c.get("row_end") or 0)
+        if rs != row or re_ != row:
+            continue
+        t = re.sub(r"\s+", "", str(c.get("text") or "").strip())
+        if _SINGLE_SAMPLE_LETTER_RE.fullmatch(t):
+            letter_cols.append(int(c.get("col_start") or 0))
+    if len(letter_cols) < 4:
+        return False
+    band = min(letter_cols)
+    for c in cells:
+        rs = int(c.get("row_start") or 0)
+        re_ = int(c.get("row_end") or 0)
+        if rs != row or re_ != row:
+            continue
+        cs = int(c.get("col_start") or 0)
+        if cs < band:
+            continue
+        t = re.sub(r"\s+", "", str(c.get("text") or "").strip())
+        if t and len(t) > 3 and not _SINGLE_SAMPLE_LETTER_RE.fullmatch(t):
+            return False
+    return True
+
+
+def _infer_missing_sample_letter(
+    cells: List[Dict[str, Any]], cell: Dict[str, Any], row: int
+) -> Optional[str]:
+    """OCR 漏掉列代号时，用左右邻字母推断（如 N 与 P 之间 → O）。"""
+    col = int(cell.get("col_start") or 0)
+    neighbors: List[Tuple[int, str]] = []
+    for c in cells:
+        rs = int(c.get("row_start") or 0)
+        re_ = int(c.get("row_end") or 0)
+        if not (rs <= row <= re_):
+            continue
+        cc = int(c.get("col_start") or 0)
+        if cc == col:
+            continue
+        t = re.sub(r"\s+", "", str(c.get("text") or "").strip())
+        if _SINGLE_SAMPLE_LETTER_RE.fullmatch(t):
+            neighbors.append((cc, t))
+    if len(neighbors) < 2:
+        return None
+    neighbors.sort()
+    left = [n for n in neighbors if n[0] < col]
+    right = [n for n in neighbors if n[0] > col]
+    if not left or not right:
+        return None
+    _, lt = left[-1]
+    _, rt = right[0]
+    if ord(rt) - ord(lt) != 2:
+        return None
+    missing = chr(ord(lt) + 1)
+    return missing if missing.isalpha() and missing.isupper() else None
+
+
 def _skip_eval_symbol_fill(cells: List[Dict[str, Any]], cell: Dict[str, Any]) -> bool:
     """数值/分辨率行或「无法评价」+数字混排列上不填 ○/◎/△。
 
@@ -2459,6 +2522,15 @@ def detect_eval_symbols_in_empty_cells(
     for cell in cells:
         txt = (cell.get("text") or "").strip()
         if txt:
+            continue
+        row = int(cell.get("row_start") or 0)
+        if _row_is_sample_letter_header(cells, row):
+            inferred = _infer_missing_sample_letter(cells, cell, row)
+            if inferred:
+                cell["text"] = inferred
+                logger.debug(
+                    "列代号推断: cell (%d,%d) → %s", row, cell.get("col_start", -1), inferred
+                )
             continue
         if _skip_eval_symbol_fill(cells, cell):
             continue
@@ -2559,6 +2631,9 @@ def upgrade_o_to_double_circle(
             continue
         col = cell.get("col_start")
         if col is None:
+            continue
+        row = int(cell.get("row_start") or 0)
+        if _row_is_sample_letter_header(cells, row):
             continue
         if col not in eval_cols:
             eval_cols[col] = _is_eval_column(cells, col)
