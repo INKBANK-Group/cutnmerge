@@ -3135,6 +3135,79 @@ def _is_stacked_header_label(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", t))
 
 
+_WRAP_HEADER_SUFFIX_RE = re.compile(
+    r"(比率|含量|比例|浓度|份数|成分|单位|量\s*[\[%％]\]|质量\s*[\[%％]\])"
+)
+_INDEPENDENT_HDR_TAIL_RE = re.compile(
+    r"(剂|物|素|基|团|料|液|体|率|值|数|型|类|项|例|酸|胺|醇|醚|酮|醛|烃)$"
+)
+
+
+def _compact_header_text(text: str) -> str:
+    return "".join((text or "").split())
+
+
+def _looks_like_independent_header_label(text: str) -> bool:
+    """像完整独立列头（如添加剂、热产碱剂），而非折行片段。"""
+    compact = _compact_header_text(text)
+    if len(compact) < 2:
+        return False
+    # 配方代号/字母子列行是长表头折行的一部分，不是独立 stacked 标签
+    if re.search(r"[\(（][A-Za-zα-ωΑ-Ω]", compact):
+        return False
+    if re.search(r"[A-Za-z]", compact) and len(compact) > 4:
+        return False
+    return bool(_INDEPENDENT_HDR_TAIL_RE.search(compact))
+
+
+def _looks_like_wrapped_header_lines(
+    parts: Sequence[str],
+    row_span: int,
+) -> bool:
+    """\\n 多行是单格内折行（如竖向长表头），不是每行一个独立表头。"""
+    if len(parts) <= 1:
+        return False
+    # 折行数多于 rowspan：不可能是「每行一标签」
+    if len(parts) > row_span:
+        return True
+    joined = _compact_header_text("".join(parts))
+    if _WRAP_HEADER_SUFFIX_RE.search(joined):
+        if not any(
+            _WRAP_HEADER_SUFFIX_RE.search(_compact_header_text(p))
+            for p in parts[:-1]
+        ):
+            return True
+    for i in range(len(parts) - 1):
+        a = _compact_header_text(parts[i])
+        b = _compact_header_text(parts[i + 1])
+        if len(a) < 2 or len(b) < 2:
+            continue
+        if a[-1] in ")）]】%％" or b[0] in "(（[【":
+            continue
+        if not re.search(r"[\u4e00-\u9fff]", a) or not re.search(r"[\u4e00-\u9fff]", b):
+            continue
+        if _looks_like_independent_header_label(a) and _looks_like_independent_header_label(b):
+            continue
+        combined = a + b
+        if len(a) <= 8 and _WRAP_HEADER_SUFFIX_RE.search(combined):
+            return True
+        if len(a) <= 8 and not _looks_like_independent_header_label(a):
+            return True
+    return False
+
+
+def _looks_like_independent_stacked_header_lines(
+    parts: Sequence[str],
+    row_span: int,
+) -> bool:
+    """True = 每行一个独立表头，可按 rowspan 拆成上下格。"""
+    if len(parts) < 2 or len(parts) > row_span:
+        return False
+    if _looks_like_wrapped_header_lines(parts, row_span):
+        return False
+    return all(_looks_like_independent_header_label(p) for p in parts)
+
+
 def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """表头带内 rowspan>1 且叠放独立中文标签 → 按行拆成上下两格（如添加剂/热产碱剂）。"""
     if not cells:
@@ -3153,9 +3226,12 @@ def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str
         if _lettered_parent_letter(str(c.get("text") or "")):
             continue
         parts = [p.strip() for p in str(c.get("text") or "").split("\n") if p.strip()]
+        row_span = re - rs + 1
         if len(parts) < 2:
             continue
         if not all(_is_stacked_header_label(p) for p in parts):
+            continue
+        if not _looks_like_independent_stacked_header_lines(parts, row_span):
             continue
         n_parts = min(len(parts), re - rs + 1)
         if n_parts < 2:
