@@ -91,6 +91,69 @@ def _looks_like_repeated_header_units(text: str) -> bool:
     return True
 
 
+def _parse_alternating_two_cjk_units(compact: str) -> Optional[List[str]]:
+    """
+    解析「A B A B …」型无数字重复表头（如 质量份/摩尔比 交替拼接）。
+
+    枚举前两段长度 (la, lb)，以 compact[:la]、compact[la:la+lb] 为交替单元；
+    末段允许为完整单元的真前缀（OCR 截断）。
+    """
+    if not compact:
+        return None
+    compact = re.sub(r"\s+", "", compact)
+    if len(compact) < 4 or not _CJK_RE.search(compact):
+        return None
+    n = len(compact)
+    best: Optional[List[str]] = None
+    best_score = -1
+    for la in range(2, min(6, n)):
+        for lb in range(2, min(6, n)):
+            if la + lb > n:
+                continue
+            unit_a = compact[:la]
+            unit_b = compact[la : la + lb]
+            if not (_CJK_RE.search(unit_a) and _CJK_RE.search(unit_b)):
+                continue
+            parts: List[str] = []
+            pos = 0
+            use_a = True
+            ok = True
+            while pos < n:
+                u = unit_a if use_a else unit_b
+                if pos + len(u) > n:
+                    tail = compact[pos:]
+                    if u.startswith(tail) and len(tail) >= 1:
+                        parts.append(tail)
+                        pos = n
+                    else:
+                        ok = False
+                    break
+                chunk = compact[pos : pos + len(u)]
+                if chunk != u:
+                    ok = False
+                    break
+                parts.append(chunk)
+                pos += len(u)
+                use_a = not use_a
+            if not ok or len(parts) < 2:
+                continue
+            uniq = {p for p in parts if len(p) >= 2}
+            if len(uniq) < 2:
+                continue
+            score = len(parts) * 10 - abs(la - lb)
+            if score > best_score:
+                best_score = score
+                best = parts
+    return best
+
+
+def _looks_like_alternating_cjk_units(text: str) -> bool:
+    """两单元 CJK 表头交替重复（质量份摩尔比…）。"""
+    compact = re.sub(r"\s+", "", text or "")
+    parts = _parse_alternating_two_cjk_units(compact)
+    return bool(parts and len(parts) >= 2)
+
+
 def _should_block_geom_header_split(text: str) -> bool:
     """
     单段中文表头不应走 geom fallback 按 col_seps 硬切或 explode colspan。
@@ -101,6 +164,8 @@ def _should_block_geom_header_split(text: str) -> bool:
     if len(compact) < 4:
         return False
     if _looks_like_repeated_header_units(text):
+        return False
+    if _looks_like_alternating_cjk_units(text):
         return False
     if re.search(r"[A-Za-z]\s*\(\s*\d+", compact):
         return False
@@ -402,6 +467,41 @@ def _split_sticky_column_header(
     return pieces if len(pieces) >= 2 else None
 
 
+def _split_alternating_cjk_header(
+    tb: Dict[str, Any],
+    cells: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """顶栏「质量份摩尔比…」类交替 CJK 单元粘连框按列界切分。"""
+    text = str(tb.get("text") or "").strip()
+    if not text:
+        return None
+    compact = re.sub(r"\s+", "", text)
+    parts = _parse_alternating_two_cjk_units(compact)
+    if not parts or len(parts) < 2:
+        return None
+
+    tb_box = _text_bbox(tb)
+    x1, y1, x2, y2 = tb_box
+    slot_boxes = _equal_split_tb_boxes(tb, len(parts))
+    if len(slot_boxes) < 2:
+        return None
+
+    pieces: List[Dict[str, Any]] = []
+    for i, part in enumerate(parts):
+        if not part:
+            continue
+        xa, _ya, xb, _yb = slot_boxes[i]
+        piece = dict(tb)
+        piece["text"] = part
+        piece["polygon"] = np.array(
+            [[xa, y1], [xb, y1], [xb, y2], [xa, y2]],
+            dtype=np.float64,
+        )
+        piece["top_left"] = (xa, y1)
+        pieces.append(piece)
+    return pieces if len(pieces) >= 2 else None
+
+
 def _other_header_text_in_span(
     cell: Dict[str, Any],
     cells: Sequence[Dict[str, Any]],
@@ -457,7 +557,14 @@ def explode_sticky_header_wide_cells(
         if _other_header_text_in_span(cell, cells, header_end):
             out.append(cell)
             continue
+        from ..structure.hline_repair import should_preserve_header_colspan
+
+        if should_preserve_header_colspan(cell, cells, []):
+            out.append(cell)
+            continue
         parts = _parse_sticky_column_parts(text)
+        if not parts or len(parts) < 2:
+            parts = _parse_alternating_two_cjk_units(re.sub(r"\s+", "", text))
         if not parts or len(parts) < 2:
             out.append(cell)
             continue
@@ -1410,6 +1517,7 @@ def _try_split_across_cells(
     binary: Optional[np.ndarray] = None,
     col_seps: Optional[Sequence[float]] = None,
     v_separators: Optional[Sequence[Any]] = None,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> bool:
     """
     几何门槛 + 墨水间隙校验后，按字宽模型切分跨多列 OCR 框。
@@ -1427,7 +1535,19 @@ def _try_split_across_cells(
     if len(text.strip()) < 2:
         return False
 
+    from ..structure.hline_repair import should_preserve_header_colspan, _is_header_shard
+
     tb_box = _text_bbox(tb)
+    if _is_header_shard(text):
+        cx = (tb_box[0] + tb_box[2]) / 2.0
+        cy = (tb_box[1] + tb_box[3]) / 2.0
+        for cell in cells:
+            if not should_preserve_header_colspan(cell, cells, list(text_boxes or [])):
+                continue
+            cb = _cell_bbox(cell)
+            if cb[0] - 2 <= cx <= cb[2] + 2 and cb[1] - 2 <= cy <= cb[3] + 2:
+                return False
+
     text_w = max(tb_box[2] - tb_box[0], 1.0)
     cy = (tb_box[1] + tb_box[3]) / 2.0
 
@@ -1507,18 +1627,23 @@ def _try_split_across_cells(
     if len(slots) < 2:
         return False
 
+    alt_parts: Optional[List[str]] = None
+    if _looks_like_alternating_cjk_units(text):
+        alt_parts = _parse_alternating_two_cjk_units(re.sub(r"\s+", "", text))
+
     slot_widths = [b - a for a, b in slots]
     min_cw = min(slot_widths)
     mean_cw = float(np.mean(slot_widths))
     # 文本须明显宽于单列，避免把「(B) 成分」这类短标签切开
-    if text_w < 1.5 * mean_cw:
+    if text_w < 1.5 * mean_cw and not (alt_parts and len(alt_parts) >= 2):
         return False
 
     edge_tol = _EDGE_ALIGN_FRAC * min_cw
-    if tb_box[0] - slots[0][0] > edge_tol * 2:
-        return False
-    if slots[-1][1] - tb_box[2] > edge_tol * 2:
-        return False
+    if not (alt_parts and len(alt_parts) >= 2):
+        if tb_box[0] - slots[0][0] > edge_tol * 2:
+            return False
+        if slots[-1][1] - tb_box[2] > edge_tol * 2:
+            return False
 
     ink, abs_x0, box_h, pitch = _ink_profile(binary, tb_box)
     char_pitch = max(4.0, text_w / max(len(text), 1))
@@ -1561,11 +1686,21 @@ def _try_split_across_cells(
     if use_geom_fallback:
         if _should_block_geom_header_split(text):
             return False
-        snapped = [slots[j][1] for j in range(len(slots) - 1)]
-        cut_indices = [
-            _x_to_char_index(text, (sx - tb_box[0]) / text_w) for sx in snapped
-        ]
-        cuts = [0] + cut_indices + [len(text)]
+        if alt_parts and len(alt_parts) >= 2:
+            use_n = min(len(alt_parts), len(slots))
+            cuts = [0]
+            pos = 0
+            for i in range(use_n):
+                pos += len(alt_parts[i])
+                cuts.append(pos)
+            while len(cuts) < len(slots) + 1:
+                cuts.append(len(text))
+        else:
+            snapped = [slots[j][1] for j in range(len(slots) - 1)]
+            cut_indices = [
+                _x_to_char_index(text, (sx - tb_box[0]) / text_w) for sx in snapped
+            ]
+            cuts = [0] + cut_indices + [len(text)]
         for i in range(1, len(cuts)):
             if cuts[i] < cuts[i - 1]:
                 cuts[i] = cuts[i - 1]
@@ -1593,7 +1728,9 @@ def _try_split_across_cells(
             return False
 
         all_wide = all(w >= wide_need for w in run_widths)
-        is_repeat = _looks_like_repeated_header_units(text)
+        is_repeat = _looks_like_repeated_header_units(text) or _looks_like_alternating_cjk_units(
+            text
+        )
         fits = _pieces_match_slot_widths(text, cuts, slots)
         if all_wide:
             # 非重复标签还须列宽比例匹配，避免「基团的|化合物」这类误切
@@ -1612,8 +1749,12 @@ def _try_split_across_cells(
     # 若多个 slot 落到同一合并格，按 col_seps 拆开该格
     if col_seps is not None and not _should_block_geom_header_split(text):
         unique_targets = {t for t in cell_targets if t is not None}
+        from ..structure.hline_repair import should_preserve_header_colspan
+
         for t in list(unique_targets):
             if max(int(cells[t].get("col_span") or 1), 1) <= 1:
+                continue
+            if should_preserve_header_colspan(cells[t], cells, list(text_boxes or [])):
                 continue
             mapping = _explode_colspan_cell(cells, t, col_seps)
             for si, slot in enumerate(slots):
@@ -1625,7 +1766,10 @@ def _try_split_across_cells(
 
     assigned_any = False
     for si, (a, b) in enumerate(slots):
-        part = text[cuts[si] : cuts[si + 1]].strip()
+        if alt_parts and si < len(alt_parts):
+            part = alt_parts[si].strip()
+        else:
+            part = text[cuts[si] : cuts[si + 1]].strip()
         if not part:
             continue
         piece = dict(tb)
@@ -1685,6 +1829,165 @@ def _nearest_empty_header_cell(
     return best_i
 
 
+def _header_pair_regions(
+    cells: Sequence[Dict[str, Any]],
+) -> List[Tuple[int, float, float]]:
+    """顶栏 colspan=2 父列 → (左原子列号, x1, x2)。"""
+    pairs: List[Tuple[int, float, float]] = []
+    seen: set[int] = set()
+    for c in cells:
+        if max(int(c.get("col_span") or 1), 1) != 2:
+            continue
+        if int(c.get("row_start", 99)) > 1:
+            continue
+        cs = int(c["col_start"])
+        if cs in seen:
+            continue
+        x1, _y1, x2, _y2 = _cell_bbox(c)
+        pairs.append((cs, x1, x2))
+        seen.add(cs)
+    pairs.sort(key=lambda t: t[0])
+    return pairs
+
+
+def _is_numeric_only_tb(tb: Dict[str, Any]) -> bool:
+    compact = re.sub(r"\s+", "", str(tb.get("text") or ""))
+    return bool(compact) and bool(_NUM_ONLY_RE.fullmatch(compact))
+
+
+def _find_cell_for_row_col(
+    cells: Sequence[Dict[str, Any]],
+    row: int,
+    col: int,
+    cy: float,
+) -> Optional[int]:
+    best_i: Optional[int] = None
+    best_d = 1e18
+    for i, c in enumerate(cells):
+        if int(c["col_start"]) != col or int(c["col_end"]) != col:
+            continue
+        if not (int(c["row_start"]) <= row <= int(c["row_end"])):
+            continue
+        cb = _cell_bbox(c)
+        cc = (cb[1] + cb[3]) / 2.0
+        d = abs(cc - cy)
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
+def _prefer_pair_left_for_numeric(
+    piece_tb: Dict[str, Any],
+    cells: Sequence[Dict[str, Any]],
+    row_seps: Sequence[float],
+    pairs: Sequence[Tuple[int, float, float]],
+    *,
+    preferred_row: Optional[int] = None,
+) -> Optional[int]:
+    """
+    colspan=2 父列下的窄数字 OCR 框：中心落在父列范围内时归左原子列。
+
+    用于底行「每共聚物仅一个用量」而结构仍保留质量份/摩尔比双列的情形。
+    """
+    if not pairs or not _is_numeric_only_tb(piece_tb):
+        return None
+    tb_box = _text_bbox(piece_tb)
+    cx = (tb_box[0] + tb_box[2]) / 2.0
+    cy = (tb_box[1] + tb_box[3]) / 2.0
+    row = preferred_row if preferred_row is not None else _row_index_of(cy, row_seps)
+    if row < 0:
+        return None
+    for left_col, x1, x2 in pairs:
+        if x1 - 4 <= cx <= x2 + 4:
+            return _find_cell_for_row_col(cells, row, left_col, cy)
+    return None
+
+
+def _realign_pair_left_numeric_cells(
+    cells: List[Dict[str, Any]],
+    pairs: Sequence[Tuple[int, float, float]],
+    row_seps: Sequence[float],
+) -> None:
+    """将落在 colspan=2 父列范围内的数字挪到左原子列（归属后纠偏）。"""
+    if not pairs:
+        return
+    by_key: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for c in cells:
+        rs, row_end = int(c["row_start"]), int(c["row_end"])
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        if rs != row_end or cs != ce:
+            continue
+        by_key[(rs, cs)] = c
+
+    for cell in cells:
+        txt = re.sub(r"\s+", "", str(cell.get("text") or ""))
+        if not txt or not _NUM_ONLY_RE.fullmatch(txt):
+            continue
+        rs = int(cell["row_start"])
+        if rs != int(cell["row_end"]):
+            continue
+        if not _row_is_pair_single_value_row(cells, rs, pairs):
+            continue
+        cs = int(cell["col_start"])
+        tb_box = _cell_bbox(cell)
+        cx = (tb_box[0] + tb_box[2]) / 2.0
+        cy = (tb_box[1] + tb_box[3]) / 2.0
+        for left_col, x1, x2 in pairs:
+            if not (x1 - 4 <= cx <= x2 + 4):
+                continue
+            if cs == left_col:
+                break
+            left = by_key.get((rs, left_col))
+            if left is None:
+                break
+            left_txt = re.sub(r"\s+", "", str(left.get("text") or ""))
+            if left_txt in {"", "-"} or _DASH_ONLY_RE.fullmatch(left_txt or ""):
+                left["text"] = cell["text"]
+                cell["text"] = ""
+            break
+
+
+def _row_is_pair_single_value_row(
+    cells: Sequence[Dict[str, Any]],
+    row: int,
+    pairs: Sequence[Tuple[int, float, float]],
+) -> bool:
+    """每 colspan=2 父列至多一个数字 → 引发剂/溶剂/分子量等底行。"""
+    if not pairs:
+        return False
+    hit_pairs = 0
+    for left_col, _, _ in pairs:
+        nums = 0
+        for off in (0, 1):
+            c = None
+            for cand in cells:
+                if (
+                    int(cand["row_start"]) == row == int(cand["row_end"])
+                    and int(cand["col_start"]) == left_col + off
+                ):
+                    c = cand
+                    break
+            if c is None:
+                continue
+            t = re.sub(r"\s+", "", str(c.get("text") or ""))
+            if t and _NUM_ONLY_RE.fullmatch(t):
+                nums += 1
+        if nums == 1:
+            hit_pairs += 1
+    return hit_pairs >= max(2, len(pairs) // 3)
+
+
+def realign_pair_left_numeric_cells(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """dash 处理后：将 colspan=2 父列范围内的数字归左原子列。"""
+    pairs = _header_pair_regions(cells)
+    if not pairs:
+        return cells
+    row_seps, _ = _derive_row_col_seps(cells)
+    _realign_pair_left_numeric_cells(cells, pairs, row_seps)
+    return cells
+
+
 def assign_texts_to_cells(
     cells: List[Dict[str, Any]],
     text_boxes: List[Dict[str, Any]],
@@ -1726,8 +2029,11 @@ def assign_texts_to_cells(
     _rebuild_rects()
 
     def _is_sticky_column_blob(tb: Dict[str, Any]) -> bool:
-        parts = _parse_sticky_column_parts(str(tb.get("text") or ""))
-        return bool(parts and len(parts) >= 2)
+        t = str(tb.get("text") or "")
+        parts = _parse_sticky_column_parts(t)
+        if parts and len(parts) >= 2:
+            return True
+        return _looks_like_alternating_cjk_units(t)
 
     ordered_boxes = sorted(
         text_boxes,
@@ -1770,6 +2076,7 @@ def assign_texts_to_cells(
                     binary=binary,
                     col_seps=col_seps,
                     v_separators=v_separators,
+                    text_boxes=text_boxes,
                 )
                 if not split_ok:
                     split_ok = _geometric_multi_col_split(
@@ -1908,6 +2215,7 @@ def assign_texts_to_cells(
     _recover_wufapingjia_ref2_from_ocr(cells, text_boxes)
     cells = unmerge_filled_label_rowspans(cells)
     cells = explode_sticky_header_wide_cells(cells)
+    realign_pair_left_numeric_cells(cells)
     return cells, free_texts
 
 
@@ -2245,12 +2553,16 @@ def _fill_dash_in_empty_cells(
     dash_cols: set[int],
 ) -> None:
     """缺测横线列：空单元格补 '-'（列级已确认 dash 为主）。"""
+    header_pairs = _header_pair_regions(cells)
     for cell in cells:
         if int(cell.get("col_start") or -1) not in dash_cols:
             continue
         if int(cell.get("col_span", 1)) != 1:
             continue
         if (cell.get("text") or "").strip():
+            continue
+        row = int(cell.get("row_start") or 0)
+        if _row_is_pair_single_value_row(cells, row, header_pairs):
             continue
         cell["text"] = "-"
         logger.debug(
@@ -2274,6 +2586,7 @@ def _fix_dash_column_consistency(
             col_cells[cs].append(c)
 
     dash_cols: set[int] = set()
+    header_pairs = _header_pair_regions(cells)
     for col_idx, col in col_cells.items():
         dash_count = 0
         suspect_cells: List[Dict[str, Any]] = []
@@ -2295,6 +2608,9 @@ def _fix_dash_column_consistency(
             continue
         dash_cols.add(col_idx)
         for c in suspect_cells:
+            row = int(c.get("row_start") or 0)
+            if _row_is_pair_single_value_row(cells, row, header_pairs):
+                continue
             logger.debug("列 %d dash 一致性: %r → '-'", col_idx, c.get("text"))
             c["text"] = "-"
 

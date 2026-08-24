@@ -24,6 +24,7 @@ from ..matching.matching import (
     _fix_dash_column_consistency,
     detect_dashes_in_empty_cells,
     detect_eval_symbols_in_empty_cells,
+    realign_pair_left_numeric_cells,
     upgrade_o_to_double_circle,
 )
 from ..ocr.ocr_post import postprocess_text_boxes
@@ -677,6 +678,10 @@ def _extract_via_tsr(
         if len(col_seps_list) >= 3:
             col_seps = col_seps_list
 
+    from ..structure.hline_repair import repair_parent_header_shard_colspans
+
+    cells = repair_parent_header_shard_colspans(cells, text_boxes)
+
     from ..structure.transpose_fix import (
         maybe_fix_transposed_table,
         maybe_lines_fallback_after_transpose,
@@ -722,9 +727,12 @@ def _extract_via_tsr(
         col_seps=col_seps,
         v_separators=v_separators,
     )
+    # 归属可能把父表头 colspan 拆成短碎片；按子表头列宽重新合并
+    cells = repair_parent_header_shard_colspans(cells, text_boxes)
     cells = merge_stacked_chem_amount_cells(cells)
     cells = _fix_dash_column_consistency(cells, binary=binary)
     cells = detect_dashes_in_empty_cells(cells, binary)
+    cells = realign_pair_left_numeric_cells(cells)
     cells = detect_eval_symbols_in_empty_cells(cells, binary)
     cells = upgrade_o_to_double_circle(cells, binary)
     cells = peel_row_header_text(cells, text_boxes)

@@ -2981,6 +2981,113 @@ def _compact_logic_columns(
     return out
 
 
+def _normalize_nested_column_group_headers(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    多级列组表头归一化（通用，非单表补丁）：
+
+    1. 父表头行短 CJK 碎片 → 合并为 colspan 父头（如 酸催+化剂 → 酸催化剂）
+    2. 子表头行空槽 → 按同宽兄弟列组模板补全（如 溶剂下缺 量(g)）
+    """
+    if not cells:
+        return cells
+
+    from ..structure.hline_repair import (
+        repair_parent_header_shard_colspans,
+        _nested_header_parent_sub_rows,
+    )
+    from ..structure.tsr_refine import _derive_seps as _derive_seps_hr
+
+    work = repair_parent_header_shard_colspans(cells, [])
+
+    header_end = _top_header_band_end(work)
+    if header_end < 1:
+        return work
+
+    row_seps, _ = _derive_seps_hr(work)
+    parent_row, bottom_row = _nested_header_parent_sub_rows(work, [], row_seps)
+    top_row = parent_row
+    max_col = max(int(c["col_end"]) for c in work)
+    body_start = header_end + 1
+
+    def _label_at(row: int, col: int) -> str:
+        cell = _atomic_header_at(work, row, col)
+        return str(cell.get("text") or "").strip() if cell else ""
+
+    def _group_top_span(cs: int) -> Tuple[int, int]:
+        """从 cs 起顶行连续原子格 / colspan 父格覆盖的列区间。"""
+        for c in work:
+            if int(c["row_start"]) > top_row or int(c["row_end"]) < top_row:
+                continue
+            pcs, pce = int(c["col_start"]), int(c["col_end"])
+            if pcs <= cs <= pce and pce > pcs:
+                return pcs, pce
+        ce = cs
+        while ce + 1 <= max_col:
+            if _atomic_header_at(work, top_row, ce + 1) is None:
+                break
+            ce += 1
+        return cs, ce
+
+    templates: Dict[int, List[str]] = {}
+    col = 0
+    while col <= max_col:
+        cs, ce = _group_top_span(col)
+        width = ce - cs + 1
+        if width >= 2:
+            labels = [_label_at(bottom_row, c) for c in range(cs, ce + 1)]
+            filled = sum(1 for t in labels if t and not _is_header_unit_line(t))
+            if filled >= width:
+                templates[width] = labels
+        col = ce + 1
+
+    if not templates:
+        return work
+
+    filled_n = 0
+    col = 0
+    while col <= max_col:
+        cs, ce = _group_top_span(col)
+        width = ce - cs + 1
+        if width >= 2 and width in templates:
+            tmpl = templates[width]
+            for off in range(width):
+                ccol = cs + off
+                cur = _label_at(bottom_row, ccol)
+                if cur and not _is_cell_frag(cur):
+                    continue
+                if not tmpl[off] or _is_header_unit_line(tmpl[off]):
+                    continue
+                if not (
+                    _column_has_data_values(
+                        work, ccol, skip_rows=set(range(body_start))
+                    )
+                    or _column_has_body_content(work, ccol, header_end)
+                ):
+                    continue
+                slot = _atomic_header_at(work, bottom_row, ccol)
+                if slot is None:
+                    ref = _atomic_header_at(work, bottom_row, cs) or _atomic_header_at(
+                        work, top_row, cs
+                    )
+                    if ref is None:
+                        continue
+                    bbox = _cell_physical_bbox_x_y(ref)
+                    slot = _empty_atomic_from_bbox(ref, ccol, cs, ce, bbox)
+                    slot["row_start"] = bottom_row
+                    slot["row_end"] = bottom_row
+                    slot["row_span"] = 1
+                    work.append(slot)
+                slot["text"] = tmpl[off]
+                filled_n += 1
+        col = ce + 1
+
+    if filled_n:
+        logger.info("子表头模板补全: %d 处", filled_n)
+    return work
+
+
 def _normalize_tiered_column_headers(
     cells: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -3511,6 +3618,7 @@ def cells_to_html_table(
         work = compress_empty_logic_rows(work)
     work = _split_mismerged_unit_rowspans(work)
     work = _merge_header_unit_rows(work)
+    work = _normalize_nested_column_group_headers(work)
     work = _normalize_tiered_column_headers(work)
     work = _split_stacked_header_rowspans(work)
     work = _merge_header_empty_below(work)
