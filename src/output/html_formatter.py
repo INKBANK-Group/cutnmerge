@@ -55,6 +55,23 @@ _BODY_INDEX_LABEL_RE = re.compile(
 )
 # 组合物父表头 vs 颜料分散液：禁止逻辑重叠时互相拼字
 _COMPOSITION_SPAN_HEADER_RE = re.compile(r"组成\s*[\[［]?\s*质量")
+_COMPOSITION_PARENT_HDR_RE = re.compile(r"^组合物$")
+_ACID_CONTENT_HDR_RE = re.compile(r"酸\s*的?\s*含量")
+_TALL_METRIC_NMP_RE = re.compile(r"NMP")
+_FORMULA_HDR_TOKEN_RE = re.compile(r"通\s*式")
+_ROOM_STORAGE_MID_RE = re.compile(r"^室温\s*放置\s*(\d+)\s*日?")
+_ROOM_STORAGE_FULL_RE = re.compile(r"^室温\s*放置\s*\d+\s*日\s*后")
+_DAY_AFTER_FRAG_RE = re.compile(r"^日?\s*后$")
+_EVAL_FILM_LEAF_RE = re.compile(r"显影时的?\s*膜\s*减少\s*量")
+_EVAL_SENS_LEAF_RE = re.compile(r"^(感度变化|感度|化)$")
+_TIMES_SHARD_RE = re.compile(r"^[×xX]$")
+_TIMES_UNIT_LINE_RE = re.compile(
+    r"^[（(]?\s*[×xX]\s*10\s*[-−–]?\s*\d*", re.I
+)
+
+
+def _has_formula_header_token(text: str) -> bool:
+    return bool(_FORMULA_HDR_TOKEN_RE.search(text or ""))
 _PIGMENT_DISPERSION_HEADER_RE = re.compile(r"颜料|分散\s*液")
 _RECIPE_CODE_BODY_RE = re.compile(
     r"^(?:Bk|PI|PBO|PS|AC|CR|AE|MBA|PGMEA|NMP|GBL|DPHA|DPCA)[-－]?",
@@ -2038,6 +2055,715 @@ def _restore_composition_parent_header(
     return cells
 
 
+def _extend_composition_parent_colspan(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """「组合物」父头应覆盖同行/下一行的 (A)(B)(C) 子列，含左侧误空的 (A) 树脂列。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 2:
+        return cells
+    work = [dict(c) for c in cells]
+    top_row = min(int(c["row_start"]) for c in work if not c.get("_drop_render"))
+    for parent in work:
+        if parent.get("_drop_render"):
+            continue
+        if int(parent["row_start"]) > header_end:
+            continue
+        t = str(parent.get("text") or "").strip()
+        if not t or not _COMPOSITION_PARENT_HDR_RE.match("".join(t.split())):
+            continue
+        pr = int(parent["row_start"])
+        pc_s, pc_e = int(parent["col_start"]), int(parent["col_end"])
+        letter_cols: List[int] = []
+        # (A)(B)(C) 可能在 parent 同行或下一行（P42: A 在下一行）
+        search_rows = {pr, pr + 1, pr - 1}
+        search_rows = {r for r in search_rows if 0 <= r <= header_end}
+        for c in work:
+            if c.get("_drop_render") or c is parent:
+                continue
+            cr = int(c["row_start"])
+            if cr not in search_rows:
+                continue
+            col = int(c["col_start"])
+            if col < pc_s - 4 or col > pc_e + 2:
+                continue
+            if _lettered_parent_letter(str(c.get("text") or "")):
+                letter_cols.append(col)
+        if len(letter_cols) < 2:
+            continue
+        letter_cols.sort()
+        new_cs = min(pc_s, letter_cols[0])
+        new_ce = max(pc_e, letter_cols[-1])
+        changed = False
+        if new_cs != pc_s or new_ce != pc_e:
+            parent["col_start"] = new_cs
+            parent["col_end"] = new_ce
+            changed = True
+        if int(parent["row_start"]) > top_row:
+            parent["row_start"] = top_row
+            changed = True
+        if changed:
+            _refresh_cell_spans(parent)
+            logger.info("组合物父头扩展: r%d c%d-%d", int(parent["row_start"]), new_cs, new_ce)
+    return work
+
+
+def _ensure_composition_parent_header(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """表头带存在 (A)(B)(C) 字母父头但缺「组合物」顶栏时补建（P42 同类）。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 1:
+        return cells
+    work = [dict(c) for c in cells]
+    top_row = min(int(c["row_start"]) for c in work if not c.get("_drop_render"))
+
+    for c in work:
+        if c.get("_drop_render") or int(c["row_start"]) > header_end:
+            continue
+        if _COMPOSITION_PARENT_HDR_RE.match("".join(str(c.get("text") or "").split())):
+            return work
+
+    letter_cells: List[Dict[str, Any]] = []
+    for c in work:
+        if c.get("_drop_render") or int(c["row_start"]) > header_end:
+            continue
+        if _lettered_parent_letter(str(c.get("text") or "")) in ("a", "b", "c"):
+            letter_cells.append(c)
+    if len(letter_cells) < 2:
+        return work
+
+    cs = min(int(c["col_start"]) for c in letter_cells)
+    ce = max(int(c["col_end"]) for c in letter_cells)
+
+    for c in work:
+        if c.get("_drop_render") or int(c["row_start"]) != top_row:
+            continue
+        if str(c.get("text") or "").strip():
+            pcs, pce = int(c["col_start"]), int(c["col_end"])
+            if not (pce < cs or pcs > ce):
+                return work
+
+    for c in work:
+        if c.get("_drop_render"):
+            continue
+        if int(c["row_start"]) != top_row:
+            continue
+        if str(c.get("text") or "").strip():
+            continue
+        pcs, pce = int(c["col_start"]), int(c["col_end"])
+        if pcs <= cs and pce >= ce:
+            c["text"] = "组合物"
+            _refresh_cell_spans(c)
+            logger.info("组合物父头补写: r%d c%d-%d", top_row, cs, ce)
+            return work
+
+    for c in work:
+        if c.get("_drop_render") or int(c["row_start"]) != top_row:
+            continue
+        if str(c.get("text") or "").strip():
+            continue
+        pcs, pce = int(c["col_start"]), int(c["col_end"])
+        if pce >= cs and pcs <= ce:
+            c["_drop_render"] = True
+
+    ncol = ce - cs + 1
+    work.append(
+        {
+            "row_start": top_row,
+            "row_end": top_row,
+            "col_start": cs,
+            "col_end": ce,
+            "row_span": 1,
+            "col_span": ncol,
+            "text": "组合物",
+            "texts": [],
+            "polygon": [
+                [cs * 10, 0],
+                [ce * 10 + 8, 0],
+                [ce * 10 + 8, 8],
+                [cs * 10, 8],
+            ],
+        }
+    )
+    logger.info("组合物父头新建: r%d c%d-%d", top_row, cs, ce)
+    return work
+
+
+def _promote_tall_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """NMP/酸含量等竖表头若上方同列全空，则 row_start 提到顶行（P41 NMP 漏行）。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 1:
+        return cells
+    work = [dict(c) for c in cells]
+    top_row = min(int(c["row_start"]) for c in work if not c.get("_drop_render"))
+
+    for c in work:
+        if c.get("_drop_render"):
+            continue
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if rs <= top_row:
+            continue
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        t = str(c.get("text") or "").strip()
+        if not t:
+            continue
+        compact = "".join(t.split())
+        is_nmp = bool(_TALL_METRIC_NMP_RE.search(compact)) and "浓度" in compact
+        is_acid = bool(_ACID_CONTENT_HDR_RE.search(compact)) and "通式" not in compact
+        if not is_nmp and not is_acid:
+            continue
+        blocked = False
+        for r in range(top_row, rs):
+            if _occupied_by_col_row(work, r, cs, ce):
+                blocked = True
+                break
+        if blocked:
+            continue
+        # 去掉同列上方占位空格，避免与 rowspan 冲突
+        for other in work:
+            if other is c or other.get("_drop_render"):
+                continue
+            ors, ore = int(other["row_start"]), int(other["row_end"])
+            ocs, oce = int(other["col_start"]), int(other["col_end"])
+            if oce < cs or ocs > ce:
+                continue
+            if ors >= rs:
+                continue
+            if not str(other.get("text") or "").strip():
+                other["_drop_render"] = True
+        c["row_start"] = top_row
+        c["row_end"] = header_end
+        _refresh_cell_spans(c)
+        logger.info("竖表头上提: %r r%d→%d", t[:24], rs, top_row)
+    return work
+
+
+def _pull_up_tall_metric_headers(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """NMP 浓度 / 酸的含量 等应竖跨整段表头带；子行前缀或单位行向上并入。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 2:
+        return cells
+    top_row = min(int(c["row_start"]) for c in cells if not c.get("_drop_render"))
+    work = [dict(c) for c in cells]
+    by_key: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for c in work:
+        if c.get("_drop_render"):
+            continue
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        if rs == re:
+            by_key[(rs, cs, ce)] = c
+
+    drop_ids: Set[int] = set()
+
+    def _same_col_range(c: Dict[str, Any], cs: int, ce: int) -> bool:
+        return int(c["col_start"]) == cs and int(c["col_end"]) == ce
+
+    for anchor in work:
+        if anchor.get("_drop_render") or id(anchor) in drop_ids:
+            continue
+        t = str(anchor.get("text") or "").strip()
+        if not t:
+            continue
+        cs, ce = int(anchor["col_start"]), int(anchor["col_end"])
+        rs, re = int(anchor["row_start"]), int(anchor["row_end"])
+        if rs <= top_row:
+            continue
+        if ce > cs:
+            continue
+        if _lettered_parent_letter(t) or _is_leaf_type_amount_subheader(t):
+            continue
+        compact = "".join(t.split())
+        if _has_formula_header_token(compact) or _COMPOSITION_PARENT_HDR_RE.match(compact):
+            continue
+        is_nmp = bool(_TALL_METRIC_NMP_RE.search(compact)) and "浓度" in compact
+        is_acid = bool(_ACID_CONTENT_HDR_RE.search(compact)) and "通式" not in compact
+        if not is_nmp and not is_acid:
+            continue
+        # 已是完整 NMP 竖表头（组合物中+NMP）→ 不再 pull
+        if is_nmp and "组合物" in compact and "NMP" in compact:
+            continue
+
+        merged_text = t
+        new_rs = top_row
+
+        # 向上吸收同列前缀/空槽（组合物中的 → NMP…）
+        for up_r in range(rs - 1, top_row - 1, -1):
+            up = by_key.get((up_r, cs, ce))
+            if up is None or id(up) in drop_ids:
+                if not _occupied_by_col_row(work, up_r, cs, ce, skip=drop_ids):
+                    new_rs = up_r
+                    continue
+                break
+            up_t = str(up.get("text") or "").strip()
+            if not up_t:
+                drop_ids.add(id(up))
+                up["_drop_render"] = True
+                new_rs = up_r
+                continue
+            if _is_header_phrase_continuation(up_t, merged_text):
+                merged_text = up_t + "\n" + merged_text if up_t else merged_text
+                drop_ids.add(id(up))
+                up["_drop_render"] = True
+                new_rs = up_r
+                continue
+            break
+
+        # 向下吸收单位/括号续行
+        new_re = re
+        for down_r in range(re + 1, header_end + 1):
+            down = by_key.get((down_r, cs, ce))
+            if down is None:
+                break
+            if id(down) in drop_ids:
+                break
+            down_t = str(down.get("text") or "").strip()
+            if not down_t:
+                drop_ids.add(id(down))
+                down["_drop_render"] = True
+                new_re = down_r
+                continue
+            if _is_header_unit_line(down_t) or _is_header_phrase_continuation(
+                merged_text, down_t
+            ):
+                merged_text = merged_text + "\n" + down_t if merged_text else down_t
+                drop_ids.add(id(down))
+                down["_drop_render"] = True
+                new_re = down_r
+                continue
+            break
+
+        anchor["text"] = merged_text
+        anchor["row_start"] = new_rs
+        anchor["row_end"] = new_re
+        _refresh_cell_spans(anchor)
+
+    return [c for c in work if id(c) not in drop_ids]
+
+
+def _is_room_storage_over_eval_leaf(upper: str, lower: str) -> bool:
+    """「室温放置N…」与「显影时的膜减少量/感度」是中层/叶子，不是折行。"""
+    u, l = _compact_hdr(upper), _compact_hdr(lower)
+    if not u or not l:
+        return False
+    if not _ROOM_STORAGE_MID_RE.match(u) and "室温放置" not in u:
+        return False
+    return bool(
+        _EVAL_FILM_LEAF_RE.search(l)
+        or _EVAL_SENS_LEAF_RE.match(l)
+        or l in {"显影时的", "膜减少量", "感度变"}
+    )
+
+
+def _peel_room_storage_and_leaf(text: str) -> Tuple[str, str]:
+    """从误粘的中层格拆出「室温放置N日后」前缀与叶子残文。"""
+    raw = (text or "").strip()
+    if not raw:
+        return "", ""
+    compact = _compact_hdr(raw)
+    m_full = _ROOM_STORAGE_FULL_RE.match(compact)
+    if m_full:
+        parent = "室温放置" + re.search(r"\d+", compact).group(0) + "日后"
+        rest = compact[m_full.end() :]
+        return parent, rest
+    m = _ROOM_STORAGE_MID_RE.match(compact)
+    if not m:
+        return raw, ""
+    day = m.group(1)
+    rest = compact[m.end() :]
+    if rest.startswith("后"):
+        rest = rest[1:]
+        parent = f"室温放置{day}日后"
+    else:
+        parent = f"室温放置{day}"
+    return parent, rest
+
+
+def _is_times_shard_text(text: str) -> bool:
+    compact = _compact_hdr(text)
+    return bool(compact) and bool(_TIMES_SHARD_RE.match(compact))
+
+
+def _is_times_unit_line(text: str) -> bool:
+    compact = _compact_hdr(text)
+    if not compact:
+        return False
+    if _TIMES_UNIT_LINE_RE.match(compact):
+        return True
+    # 「(×10-6质量%)」整段单位
+    if compact[0] in "(（" and "×" in compact and "质量" in compact:
+        return True
+    if compact[0] in "(（" and "x10" in compact.lower() and "质量" in compact:
+        return True
+    return False
+
+
+def _drop_logic_columns(
+    cells: List[Dict[str, Any]], cols: Set[int]
+) -> List[Dict[str, Any]]:
+    """删除指定逻辑列并重映射 col_*。"""
+    if not cells or not cols:
+        return cells
+    max_col = max(int(c["col_end"]) for c in cells)
+    kept = [i for i in range(max_col + 1) if i not in cols]
+    if not kept:
+        return cells
+    remap = {old: new for new, old in enumerate(kept)}
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        if c.get("_drop_render"):
+            continue
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        new_idxs = [remap[i] for i in range(cs, ce + 1) if i in remap]
+        if not new_idxs:
+            continue
+        nc = dict(c)
+        nc["col_start"] = min(new_idxs)
+        nc["col_end"] = max(new_idxs)
+        _refresh_cell_spans(nc)
+        out.append(nc)
+    return out
+
+
+def _repair_room_storage_eval_headers(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """修复「室温放置N」与「日后」横拆、以及中层误吞评价叶子（通用）。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 2:
+        return cells
+    work = [dict(c) for c in cells]
+    leaf_row = header_end
+    mid_rows = list(range(1, header_end))
+    if not mid_rows:
+        mid_rows = [1]
+
+    changed = False
+    for mid in mid_rows:
+        col = 0
+        max_col = max(int(c["col_end"]) for c in work)
+        while col <= max_col:
+            left = _header_cell_origin(work, mid, col)
+            if left is None or left.get("_drop_render"):
+                col += 1
+                continue
+            lt = str(left.get("text") or "").strip()
+            if not lt or "室温" not in _compact_hdr(lt):
+                col += 1
+                continue
+            if not _ROOM_STORAGE_MID_RE.match(_compact_hdr(lt).split("显影")[0].split("膜")[0]):
+                # 宽松：含室温放置即可
+                if "室温放置" not in _compact_hdr(lt):
+                    col += 1
+                    continue
+
+            parent, glued_leaf = _peel_room_storage_and_leaf(lt)
+            right = _header_cell_origin(work, mid, col + 1)
+            rt = str(right.get("text") or "").strip() if right else ""
+            merge_day = bool(right) and bool(_DAY_AFTER_FRAG_RE.match(_compact_hdr(rt)))
+            if not parent.startswith("室温放置"):
+                col += 1
+                continue
+            # 已是完整「…日后」且无粘叶、无邻「日后」→ 跳过
+            if (
+                _ROOM_STORAGE_FULL_RE.match(_compact_hdr(parent))
+                and not glued_leaf
+                and not merge_day
+                and int(left["row_end"]) == mid
+            ):
+                col += 1
+                continue
+
+            if merge_day and not parent.endswith("日后"):
+                parent = parent.rstrip("日") + "日后"
+            elif not parent.endswith("日后") and "日" in parent:
+                # 室温放置5日 → 补「后」若右侧是日后碎片或已 peel
+                if merge_day:
+                    parent = re.sub(r"日$", "日后", parent)
+
+            # 右侧「日后」并入后丢弃该格
+            ce = int(left["col_end"])
+            if merge_day and right is not None:
+                ce = max(ce, int(right["col_end"]))
+                right["_drop_render"] = True
+                # 右列叶子「化」→ 感度变化
+                frag = _atomic_header_at(work, leaf_row, col + 1)
+                if frag is not None:
+                    ft = _compact_hdr(str(frag.get("text") or ""))
+                    if ft in {"化", "感度", "感度变"} or not ft:
+                        frag["text"] = "感度变化"
+
+            left["text"] = parent
+            left["row_start"] = mid
+            left["row_end"] = mid
+            left["col_end"] = ce
+            _refresh_cell_spans(left)
+
+            # 粘连的叶子：显影时的膜减少量
+            leaf_text = glued_leaf
+            if leaf_text:
+                if "显影" in leaf_text or "膜" in leaf_text:
+                    leaf_text = "显影时的膜减少量"
+                slot = _atomic_header_at(work, leaf_row, col)
+                if slot is None:
+                    bbox = _cell_physical_bbox_x_y(left)
+                    slot = _empty_atomic_from_bbox(left, col, col, col, bbox)
+                    slot["row_start"] = leaf_row
+                    slot["row_end"] = leaf_row
+                    work.append(slot)
+                if not str(slot.get("text") or "").strip() or _EVAL_FILM_LEAF_RE.search(
+                    leaf_text
+                ):
+                    slot["text"] = "显影时的膜减少量"
+            else:
+                # 用对称的 0 日叶子模板补全
+                slot = _atomic_header_at(work, leaf_row, col)
+                if slot is None or not str(slot.get("text") or "").strip():
+                    # 找兄弟「室温放置0日后」下的叶子
+                    for sib in work:
+                        if sib.get("_drop_render"):
+                            continue
+                        if int(sib["row_start"]) != mid:
+                            continue
+                        st = _compact_hdr(str(sib.get("text") or ""))
+                        if _ROOM_STORAGE_FULL_RE.match(st) and "0" in st:
+                            scs = int(sib["col_start"])
+                            ref = _atomic_header_at(work, leaf_row, scs)
+                            if ref and _EVAL_FILM_LEAF_RE.search(
+                                str(ref.get("text") or "")
+                            ):
+                                if slot is None:
+                                    bbox = _cell_physical_bbox_x_y(left)
+                                    slot = _empty_atomic_from_bbox(
+                                        left, col, col, col, bbox
+                                    )
+                                    slot["row_start"] = leaf_row
+                                    slot["row_end"] = leaf_row
+                                    work.append(slot)
+                                slot["text"] = str(ref.get("text") or "").strip()
+                            break
+
+            changed = True
+            col = ce + 1
+
+    if changed:
+        work = [c for c in work if not c.get("_drop_render")]
+        logger.info("室温放置评价表头修复完成")
+    return work
+
+
+def _fold_acid_times_shard_column(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """酸的含量 旁孤立「×」列 + 单位行 → 并入酸含量竖表头并删幽灵列。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 1:
+        return cells
+    work = [dict(c) for c in cells]
+    drop_cols: Set[int] = set()
+
+    acid_cells = []
+    for c in work:
+        if c.get("_drop_render") or int(c["row_start"]) > header_end:
+            continue
+        t = str(c.get("text") or "").strip()
+        if not t:
+            continue
+        compact = _compact_hdr(t)
+        if _ACID_CONTENT_HDR_RE.search(compact) and "通式" not in compact:
+            acid_cells.append(c)
+
+    for acid in acid_cells:
+        ac_s = int(acid["col_start"])
+        for side_col in (ac_s - 1, int(acid["col_end"]) + 1):
+            if side_col < 0 or side_col in drop_cols:
+                continue
+            side_hdr = [
+                c
+                for c in work
+                if not c.get("_drop_render")
+                and int(c["col_start"]) == side_col == int(c["col_end"])
+                and int(c["row_start"]) <= header_end
+            ]
+            side_texts = [
+                str(c.get("text") or "").strip()
+                for c in side_hdr
+                if str(c.get("text") or "").strip()
+            ]
+            # 允许空列：仅靠跨列单位行证明是 × 碎片列
+            spanning_units = [
+                c
+                for c in work
+                if not c.get("_drop_render")
+                and int(c["row_start"]) <= header_end
+                and int(c["col_start"]) <= side_col <= int(c["col_end"])
+                and int(c["col_end"]) >= ac_s
+                and int(c["col_start"]) <= int(acid["col_end"])
+                and (
+                    _is_times_unit_line(str(c.get("text") or ""))
+                    or _is_header_unit_line(str(c.get("text") or ""))
+                )
+            ]
+            if side_texts and not all(
+                _is_times_shard_text(t) or _is_times_unit_line(t) or _is_header_unit_line(t)
+                for t in side_texts
+            ):
+                continue
+            if not side_texts and not spanning_units:
+                continue
+            # 表体：该列无独立非空原子数据（或仅与酸列共用 colspan）
+            body_conflict = False
+            for c in work:
+                if c.get("_drop_render") or int(c["row_start"]) <= header_end:
+                    continue
+                cs, ce = int(c["col_start"]), int(c["col_end"])
+                if not (cs <= side_col <= ce):
+                    continue
+                t = str(c.get("text") or "").strip()
+                if not t:
+                    continue
+                if cs == ce == side_col:
+                    body_conflict = True
+                    break
+            if body_conflict:
+                continue
+
+            acid_text = str(acid.get("text") or "").strip()
+            for t in side_texts:
+                if _is_times_shard_text(t):
+                    continue  # × 会由单位行体现
+                if t and t not in acid_text:
+                    acid_text = (acid_text + "\n" + t).strip()
+            for u in spanning_units:
+                ut = str(u.get("text") or "").strip()
+                if ut and ut not in acid_text and "酸" not in _compact_hdr(ut):
+                    acid_text = (acid_text + "\n" + ut).strip()
+                u["_drop_render"] = True
+            acid["text"] = acid_text
+            # 酸头竖跨整段表头
+            top_row = min(
+                int(c["row_start"]) for c in work if not c.get("_drop_render")
+            )
+            acid["row_start"] = top_row
+            acid["row_end"] = header_end
+            _refresh_cell_spans(acid)
+            for c in side_hdr:
+                c["_drop_render"] = True
+            drop_cols.add(side_col)
+            logger.info("酸含量并入 × 碎片列: col %d → %d", side_col, ac_s)
+            break
+
+    if not drop_cols:
+        return work
+    work = [c for c in work if not c.get("_drop_render")]
+    return _drop_logic_columns(work, drop_cols)
+
+
+def _merge_formula_parent_colspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """「通式(5)…|、通式(6)…」在「种类|含量」上 → 合并 colspan=2（通用，补 pipeline/shard 漏网）。"""
+    from ..structure.hline_repair import (
+        _are_formula_header_complements,
+        _is_type_amount_leaf_pair,
+    )
+
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 2:
+        return cells
+    work = [dict(c) for c in cells]
+    max_col = max(int(c["col_end"]) for c in work)
+    leaf_row = header_end
+    drop_ids: Set[int] = set()
+
+    for row in range(0, header_end):
+        col = 0
+        while col < max_col:
+            left = _header_cell_origin(work, row, col)
+            right = _header_cell_origin(work, row, col + 1)
+            if left is None or right is None:
+                col += 1
+                continue
+            lt = str(left.get("text") or "").strip()
+            rt = str(right.get("text") or "").strip()
+            if not lt or not rt or not _are_formula_header_complements(lt, rt):
+                col += 1
+                continue
+            cs, ce = col, col + 1
+            b0 = _atomic_header_at(work, leaf_row, cs)
+            b1 = _atomic_header_at(work, leaf_row, ce)
+            if b0 is None or b1 is None:
+                # 叶子可能在 header_end 上一行（中层 ABC 占用一行）
+                for lr in range(header_end, max(0, header_end - 2), -1):
+                    b0 = b0 or _atomic_header_at(work, lr, cs)
+                    b1 = b1 or _atomic_header_at(work, lr, ce)
+            bl = str(b0.get("text") or "").strip() if b0 else ""
+            br = str(b1.get("text") or "").strip() if b1 else ""
+            if not _is_type_amount_leaf_pair([bl, br]):
+                col += 1
+                continue
+            merged = dict(left)
+            merged["col_end"] = int(right["col_end"])
+            merged["row_end"] = max(int(left["row_end"]), int(right["row_end"]))
+            if rt.startswith(("、", "，", ",")):
+                merged["text"] = lt + rt
+            else:
+                merged["text"] = (lt + " " + rt).strip()
+            _refresh_cell_spans(merged)
+            replaced = False
+            for i, c in enumerate(work):
+                if id(c) in drop_ids:
+                    continue
+                if int(c["row_start"]) == row and int(c["col_start"]) == cs:
+                    work[i] = merged
+                    replaced = True
+                    break
+            if not replaced:
+                work.append(merged)
+            drop_ids.add(id(right))
+            right["_drop_render"] = True
+            col += 2
+    out = [c for c in work if id(c) not in drop_ids and not c.get("_drop_render")]
+    if len(out) != len(cells):
+        logger.info("通式父头 colspan 合并: %d → %d cells", len(cells), len(out))
+    return out
+
+
+def _occupied_by_col_row(
+    cells: Sequence[Dict[str, Any]],
+    row: int,
+    cs: int,
+    ce: int,
+    *,
+    skip: Optional[Set[int]] = None,
+) -> bool:
+    skip = skip or set()
+    for c in cells:
+        if id(c) in skip or c.get("_drop_render"):
+            continue
+        if not (int(c["row_start"]) <= row <= int(c["row_end"])):
+            continue
+        ocs, oce = int(c["col_start"]), int(c["col_end"])
+        if oce < cs or ocs > ce:
+            continue
+        if str(c.get("text") or "").strip():
+            return True
+    return False
+
+
 def _split_merged_example_body_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """拆开把多条比较例/实施例粘在同一逻辑行的情形（P29：比较例5\\n比较例6）。"""
     if not cells:
@@ -2943,6 +3669,16 @@ def _split_lettered_parent_child_text(text: str) -> Tuple[str, str]:
     return raw, ""
 
 
+def _header_cell_origin(
+    cells: Sequence[Dict[str, Any]], row: int, col: int
+) -> Optional[Dict[str, Any]]:
+    """表头格起点（允许 rowspan>1，不要求 row_start==row_end）。"""
+    for c in cells:
+        if int(c["row_start"]) == row and int(c["col_start"]) == col:
+            return c
+    return None
+
+
 def _atomic_header_at(
     cells: Sequence[Dict[str, Any]], row: int, col: int
 ) -> Optional[Dict[str, Any]]:
@@ -3343,6 +4079,9 @@ def _looks_like_wrapped_header_lines(
         "\n".join(parts[1:])
     ):
         return False
+    # 室温放置 + 显影/感度叶子：独立上下格
+    if _is_room_storage_over_eval_leaf(parts[0], "\n".join(parts[1:])):
+        return False
     # 折行数多于 rowspan：不可能是「每行一标签」
     if len(parts) > row_span:
         return True
@@ -3414,9 +4153,12 @@ def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str
             _lettered_parent_letter(parts[0])
             and _is_leaf_type_amount_subheader("\n".join(parts[1:]))
         )
+        room_leaf_split = bool(
+            _is_room_storage_over_eval_leaf(parts[0], "\n".join(parts[1:]))
+        )
         if _lettered_parent_letter(raw) and not lettered_leaf_split:
             continue
-        if not lettered_leaf_split:
+        if not lettered_leaf_split and not room_leaf_split:
             if not all(_is_stacked_header_label(p) for p in parts):
                 continue
             if not _looks_like_independent_stacked_header_lines(parts, row_span):
@@ -3424,10 +4166,24 @@ def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str
         n_parts = min(len(parts), re - rs + 1)
         if n_parts < 2:
             continue
-        # 字母父头：上行保留父名，其余叶子行合并进最后一格（种类+(量)）
-        if lettered_leaf_split and n_parts >= 2:
-            leaf_joined = "\n".join(parts[1:])
-            split_parts = [parts[0], leaf_joined]
+        # 字母父头 / 室温放置中层：上行保留父名，其余叶子合并进下一格
+        if (lettered_leaf_split or room_leaf_split) and n_parts >= 2:
+            if room_leaf_split:
+                parent_txt, _ = _peel_room_storage_and_leaf(parts[0])
+                if not parent_txt.endswith("日后") and not parent_txt.endswith("日"):
+                    parent_txt = parts[0].split("\n")[0].strip()
+                leaf_joined = "显影时的膜减少量"
+                for p in parts[1:]:
+                    if _EVAL_FILM_LEAF_RE.search(_compact_hdr(p)) or "显影" in p or "膜" in p:
+                        leaf_joined = "显影时的膜减少量"
+                        break
+                    if _EVAL_SENS_LEAF_RE.match(_compact_hdr(p)):
+                        leaf_joined = "感度变化" if "化" in p or "变" in p else "感度"
+                        break
+                split_parts = [parent_txt or parts[0], leaf_joined]
+            else:
+                leaf_joined = "\n".join(parts[1:])
+                split_parts = [parts[0], leaf_joined]
             n_parts = 2
             # 父头只占首行，叶子占剩余行
             c["text"] = split_parts[0]
@@ -3502,6 +4258,9 @@ def _is_header_phrase_continuation(upper: str, lower: str) -> bool:
     # (B)组分名 / 种类(量) 是父子表头，不是折行
     if _is_lettered_parent_over_leaf_subheader(upper, lower):
         return False
+    # 室温放置 / 显影·感度 是中层与叶子，不是折行
+    if _is_room_storage_over_eval_leaf(upper, lower):
+        return False
     u, l = _compact_hdr(upper), _compact_hdr(lower)
     if not l:
         return True
@@ -3521,6 +4280,8 @@ def _is_header_phrase_continuation(upper: str, lower: str) -> bool:
 def _looks_like_wrapped_header_pair(upper: str, lower: str) -> bool:
     """上下非空标签像同一短语折行（非两个独立列头）。"""
     if _is_lettered_parent_over_leaf_subheader(upper, lower):
+        return False
+    if _is_room_storage_over_eval_leaf(upper, lower):
         return False
     if _is_header_phrase_continuation(upper, lower):
         return True
@@ -3844,6 +4605,7 @@ def cells_to_html_table(
     work = _split_merged_example_body_rows(work)
     work = _peel_glued_example_index_columns(work)
     work = _restore_composition_parent_header(work)
+    work = _extend_composition_parent_colspan(work)
     if compress_empty:
         work = compress_empty_logic_columns(work)
         work = compress_empty_logic_rows(work)
@@ -3851,8 +4613,18 @@ def cells_to_html_table(
     work = _merge_header_unit_rows(work)
     work = _normalize_nested_column_group_headers(work)
     work = _normalize_tiered_column_headers(work)
+    from ..structure.hline_repair import repair_parent_header_shard_colspans
+
+    work = repair_parent_header_shard_colspans(work, [])
+    work = _merge_formula_parent_colspans(work)
+    work = _ensure_composition_parent_header(work)
+    work = _extend_composition_parent_colspan(work)
+    work = _promote_tall_header_rowspans(work)
     work = _split_stacked_header_rowspans(work)
+    work = _repair_room_storage_eval_headers(work)
+    work = _fold_acid_times_shard_column(work)
     work = _merge_header_empty_below(work)
+    work = _repair_room_storage_eval_headers(work)
     work = [c for c in work if not c.get("_drop_render")]
     if not work:
         return ""

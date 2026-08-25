@@ -11,3 +11,4 @@ data/
 CLAUDE.md
 models/
 tools/
+check.py

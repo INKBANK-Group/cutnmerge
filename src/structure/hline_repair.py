@@ -721,6 +721,31 @@ def _is_parent_header_fragment(text: str) -> bool:
     return False
 
 
+def _has_formula_header_token(text: str) -> bool:
+    return bool(re.search(r"通\s*式", text or ""))
+
+
+def _are_formula_header_complements(left: str, right: str) -> bool:
+    """通式(5)… / 、通式(6)… 被竖线误拆成相邻两格的同一父头。
+
+    与「基础|聚合物」双列独立父头不同：两侧都在讲通式编号，或右格以顿号续写。
+    """
+    lc, rc = _compact(left), _compact(right)
+    if not lc or not rc:
+        return False
+    left_f, right_f = _has_formula_header_token(lc), _has_formula_header_token(rc)
+    if left_f and right_f:
+        return True
+    if left_f and rc[:1] in "、，,":
+        return True
+    if right_f and lc[-1:] in "、，,":
+        return True
+    # 「通式(5)的化合物」+「(6)」编号残片
+    if left_f and re.match(r"^[、，,]?[（(]?\d+[）)]?", rc):
+        return True
+    return False
+
+
 def _are_mergeable_parent_shards(left: str, right: str) -> bool:
     """相邻两格是否应拼为同一父表头（左右皆碎片，或左残尾+右续头）。
 
@@ -734,6 +759,9 @@ def _are_mergeable_parent_shards(left: str, right: str) -> bool:
         return True
     if not lc or not rc:
         return False
+    # 通式折行误拆：两侧虽不像短碎片，仍是同一父头
+    if _are_formula_header_complements(left, right):
+        return True
     # 右半截续头已收束 → 下一组左半截是新短语起点
     if _PARENT_CONT_HEAD_RE.match(lc):
         return False
@@ -741,6 +769,9 @@ def _are_mergeable_parent_shards(left: str, right: str) -> bool:
     if _PARENT_INCOMPLETE_TAIL_RE.search(lc) and _PARENT_CONT_HEAD_RE.match(rc):
         return True
     if _is_header_shard(lc) and _PARENT_CONT_HEAD_RE.match(rc):
+        return True
+    # 「室温放置5」+「日后」：左已含数字日，右仅为「日后」续片
+    if re.match(r"^室温放置\d+日?$", lc) and re.match(r"^日?\s*后$", rc):
         return True
     # 通式前缀 + 后半：「(6)的」+「化合物」
     if _PARENT_FORMULA_PREFIX_RE.match(lc) and _is_parent_header_fragment(right):
@@ -1107,19 +1138,11 @@ def _labels_in_row_range(
     return out
 
 
-def _is_paired_dual_column_group(
-    top_labels: Sequence[str],
-    bottom_labels: Sequence[str],
-) -> bool:
-    """两列组：顶行两个独立语义词 + 底行「种类|量」型配对 → 保持横向拆分（如 基础|聚合物）。"""
-    tops = [t for t in top_labels if t]
-    bots = [t for t in bottom_labels if t]
-    if len(tops) != 2 or len(bottom_labels) != 2:
+def _is_type_amount_leaf_pair(bottom_labels: Sequence[str]) -> bool:
+    """底行是否为「种类|含量/量」叶子配对。"""
+    if len(bottom_labels) != 2:
         return False
-    t0, t1 = tops[0], tops[1]
-    b0, b1 = bottom_labels[0], bottom_labels[1]
-    if _is_header_shard(t0) or _is_header_shard(t1):
-        return False
+    b0, b1 = bottom_labels[0] or "", bottom_labels[1] or ""
     type_first = bool(
         _SUBHEADER_TYPE_RE.match(b0) or "种类" in b0 or "类型" in b0
     )
@@ -1127,6 +1150,23 @@ def _is_paired_dual_column_group(
         _SUBHEADER_AMOUNT_RE.match(b1) or re.search(r"量", b1 or "")
     )
     return type_first and amt_second
+
+
+def _is_paired_dual_column_group(
+    top_labels: Sequence[str],
+    bottom_labels: Sequence[str],
+) -> bool:
+    """两列组：顶行两个独立语义词 + 底行「种类|量」型配对 → 保持横向拆分（如 基础|聚合物）。"""
+    tops = [t for t in top_labels if t]
+    if len(tops) != 2 or len(bottom_labels) != 2:
+        return False
+    t0, t1 = tops[0], tops[1]
+    if _is_header_shard(t0) or _is_header_shard(t1):
+        return False
+    # 通式互补对：底行虽是种类|含量，顶行仍是同一父头，不得当双列独立组
+    if _are_formula_header_complements(t0, t1):
+        return False
+    return _is_type_amount_leaf_pair(bottom_labels)
 
 
 def _should_merge_parent_shard_run(
@@ -1137,6 +1177,13 @@ def _should_merge_parent_shard_run(
     top_texts = [t for t in top_labels if t]
     bottom_texts = [t for t in bottom_labels if t]
     frag_count = sum(1 for t in top_labels if _is_parent_header_fragment(t))
+    # 通式(5)…|、通式(6)… 盖在 种类|含量 上：强制合并为 colspan=2
+    if (
+        len(top_texts) == 2
+        and _are_formula_header_complements(top_texts[0], top_texts[1])
+        and _is_type_amount_leaf_pair(bottom_labels)
+    ):
+        return True
     if frag_count < 2:
         return False
     # 双列「基础|聚合物 + 种类|量」保持拆分
