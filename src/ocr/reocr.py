@@ -290,6 +290,8 @@ def _suspicious_indices(cells: Sequence[Dict[str, Any]], binary: np.ndarray) -> 
 
 
 def _pack_crops(crops: Sequence[np.ndarray], target_h: int = 80, gap: int = 16, max_width: int = 1800) -> tuple[np.ndarray, List[Tuple[int, int, int, int]], List[float]]:
+    # 单块可用宽度：左右各留 gap，否则超宽竖排旋转裁块换行后仍会贴出画布
+    max_crop_w = max(8, int(max_width) - 2 * int(gap))
     scaled: List[np.ndarray] = []
     scales: List[float] = []
     for crop in crops:
@@ -300,6 +302,10 @@ def _pack_crops(crops: Sequence[np.ndarray], target_h: int = 80, gap: int = 16, 
             continue
         scale = target_h / float(h)
         new_w = max(8, int(round(w * scale)))
+        if new_w > max_crop_w:
+            # 保持目标字高，仅压窄宽度，避免 (h,w) 广播进画布失败
+            scale *= max_crop_w / float(new_w)
+            new_w = max_crop_w
         scaled.append(cv2.resize(crop, (new_w, target_h), interpolation=cv2.INTER_CUBIC))
         scales.append(scale)
 
