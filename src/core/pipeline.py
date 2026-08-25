@@ -63,7 +63,11 @@ from ..structure.tsr_refine import (
     coverage_score,
     dedupe_overlapping_cells,
     logic_conflict_ratio,
+    looks_overmerged_body_rowspans,
     looks_oversegmented,
+    looks_shallow_body_rowspans,
+    looks_undermerged_body_rowspans,
+    max_body_rowspan,
     merge_ghost_columns,
     merge_ghost_rows,
     merge_stacked_chem_amount_cells,
@@ -76,6 +80,7 @@ from ..structure.tsr_refine import (
     promote_side_header_rowspans,
     demote_ene_inside_monomer_band,
     split_glued_side_headers,
+    split_glued_polymer_monomer_header,
     refill_short_side_headers_from_ocr,
     fill_empty_child_headers_from_ocr,
     refill_truncated_monomer_child_headers_from_ocr,
@@ -85,6 +90,7 @@ from ..structure.tsr_refine import (
     split_undersplit_monomer_child_headers,
     needs_monomer_header_reconstruct,
     structure_quality_score,
+    _expand_monomer_over_child_headers,
 )
 
 logger = logging.getLogger(__name__)
@@ -553,9 +559,18 @@ def _extract_via_tsr(
     too_few_cells = bool(cells) and len(cells) < max(8, n_boxes // 8)
     # TSR 把多行单元格切成碎逻辑行时 cov 仍可能很高，须单独识别过切
     overseg = bool(cells) and looks_oversegmented(cells, text_boxes)
+    # 表体贯通列被切成多段高 rowspan（配方/水含量）时同样回退框线
+    undermerge = bool(cells) and looks_undermerged_body_rowspans(cells)
+    # wired 已压行后欠合并信号消失，但表体几乎无 rowspan 时仍对照框线
+    shallow = (
+        bool(cells)
+        and not undermerge
+        and looks_shallow_body_rowspans(cells)
+    )
+    topo_bad = overseg or undermerge or shallow
     need_lines_fallback = bool(
         (not cells or cov < 0.55 or too_few_cells) and fallback_lines
-    ) or overseg
+    ) or topo_bad
     if need_lines_fallback:
         n_cols, n_rows, n_cells = (
             cell_grid_stats(cells) if cells else (0, 0, 0)
@@ -567,6 +582,22 @@ def _extract_via_tsr(
                 n_rows,
                 n_cells,
                 len(text_boxes),
+                cov,
+            )
+        elif undermerge:
+            logger.info(
+                "TSR 表体欠合并(cols=%d rows=%d cells=%d cov=%.3f)，尝试框线回退",
+                n_cols,
+                n_rows,
+                n_cells,
+                cov,
+            )
+        elif shallow:
+            logger.info(
+                "TSR 表体浅合并(cols=%d rows=%d max_rs=%d cov=%.3f)，尝试框线回退",
+                n_cols,
+                n_rows,
+                max_body_rowspan(cells),
                 cov,
             )
         else:
@@ -590,29 +621,70 @@ def _extract_via_tsr(
         line_cells: List[Dict[str, Any]] = []
         for t in tables or []:
             line_cells.extend(list(getattr(t, "cells", None) or []))
-        if not overseg:
+        if not topo_bad:
             return outs, tables
-        # 过切场景：框线不过切，或行数明显收敛时采用框线
+        # 过切/欠合并：框线质量不降则采用。欠合并时框线常仍含少量高碎片，
+        # 但贯通列通常已比 TSR 切段更完整，故不再要求启发式彻底熄灭。
+        # 框线若把多列糊成通天 rowspan，则拒绝（避免 P81 类更糟结果）。
         if line_cells:
             lc, lr, ln = cell_grid_stats(line_cells)
-            line_ok = not looks_oversegmented(line_cells, text_boxes)
-            rows_improved = lr < n_rows * 0.65 and lr >= 4
-            qual_ok = (
+            accept = (
                 structure_quality_score(line_cells, text_boxes)
                 >= structure_quality_score(cells, text_boxes) - 0.05
             )
-            if (line_ok or rows_improved) and qual_ok:
+            if overseg:
+                line_ok = not looks_oversegmented(line_cells, text_boxes)
+                rows_improved = lr < n_rows * 0.65 and lr >= 4
+                accept = accept and (line_ok or rows_improved)
+            if undermerge:
+                line_overmerge = looks_overmerged_body_rowspans(line_cells)
+                rows_ok = lr >= 4 and lr <= n_rows
+                rows_compressed = lr <= max(4, int(n_rows * 0.55))
+                score_lines = structure_quality_score(line_cells, text_boxes)
+                score_tsr = structure_quality_score(cells, text_boxes)
+                score_ok = score_lines >= score_tsr - 0.18
+                # 行数已接近时（light 已压行）仍可用框线修贯通列，只要分不太差
+                near_rows = n_rows <= 18 and lr <= n_rows and score_lines >= score_tsr - 0.08
+                cols_plausible = 6 <= lc <= 22
+                accept = (
+                    not line_overmerge
+                    and rows_ok
+                    and (
+                        (rows_compressed and (score_ok or cols_plausible))
+                        or near_rows
+                        or (lr <= n_rows * 0.45 and cols_plausible and score_ok)
+                    )
+                )
+            if shallow and not undermerge:
+                line_overmerge = looks_overmerged_body_rowspans(line_cells)
+                score_lines = structure_quality_score(line_cells, text_boxes)
+                score_tsr = structure_quality_score(cells, text_boxes)
+                line_rs = max_body_rowspan(line_cells)
+                tsr_rs = max_body_rowspan(cells)
+                # 框线须明显恢复贯通 rowspan，且未通天糊列
+                accept = (
+                    not line_overmerge
+                    and lr >= 4
+                    and 6 <= lc <= 22
+                    and line_rs >= max(5, tsr_rs + 2)
+                    and score_lines >= score_tsr - 0.12
+                )
+            if accept:
                 logger.info(
-                    "TSR 过切已回退框线: cells %d→%d rows %d→%d cols %d→%d",
+                    "TSR 拓扑已回退框线: cells %d→%d rows %d→%d cols %d→%d"
+                    " (overseg=%s undermerge=%s shallow=%s)",
                     n_cells,
                     ln,
                     n_rows,
                     lr,
                     n_cols,
                     lc,
+                    overseg,
+                    undermerge,
+                    shallow,
                 )
                 return outs, tables
-        logger.info("框线回退未改善过切，保留 TSR 结果")
+        logger.info("框线回退未改善拓扑，保留 TSR 结果")
 
     if not cells:
         outs = _render_outputs(
@@ -678,9 +750,9 @@ def _extract_via_tsr(
         if len(col_seps_list) >= 3:
             col_seps = col_seps_list
 
-    from ..structure.hline_repair import repair_parent_header_shard_colspans
+    from ..structure.header_topology import repair_parent_header_topology
 
-    cells = repair_parent_header_shard_colspans(cells, text_boxes)
+    cells = repair_parent_header_topology(cells, text_boxes)
 
     from ..structure.transpose_fix import (
         maybe_fix_transposed_table,
@@ -727,8 +799,10 @@ def _extract_via_tsr(
         col_seps=col_seps,
         v_separators=v_separators,
     )
-    # 归属可能把父表头 colspan 拆成短碎片；按子表头列宽重新合并
-    cells = repair_parent_header_shard_colspans(cells, text_boxes)
+    # 归属可能把父表头 colspan 拆成短碎片；按子表头列宽重新合并 + 分组父头扩跨
+    from ..structure.header_topology import repair_parent_header_topology as _topo_post
+
+    cells = _topo_post(cells, text_boxes)
     cells = merge_stacked_chem_amount_cells(cells)
     cells = _fix_dash_column_consistency(cells, binary=binary)
     cells = detect_dashes_in_empty_cells(cells, binary)
@@ -743,8 +817,10 @@ def _extract_via_tsr(
         free_texts.extend(caption_texts)
     # 表题剥离后再压行，避免 [表1-2] 落在子表头行触发分段
     cells = normalize_oversegmented_table_rows(cells)
-    # 压行之后再上提误落表头 / 侧栏 rowspan，避免 normalize 把表头拽回合成例行
+    # 聚合物+单体粘连拆开，再上提误落表头 / 侧栏 rowspan
+    cells = split_glued_polymer_monomer_header(cells)
     cells = lift_misplaced_header_labels(cells)
+    cells = split_glued_polymer_monomer_header(cells)
     cells = demote_ene_inside_monomer_band(cells)
     cells = promote_side_header_rowspans(cells)
     cells = split_glued_side_headers(cells)
@@ -755,6 +831,8 @@ def _extract_via_tsr(
     cells = split_undersplit_monomer_child_headers(cells)
     # 切分/补字后再吸收空槽，避免把还能从 OCR 填上的子头列并掉
     cells = absorb_empty_child_header_gaps(cells)
+    # 补…剂后按子头带重裁「单体」左右缘（避免盖住聚合物/侧栏）
+    cells = _expand_monomer_over_child_headers(cells)
     cells = sanitize_side_header_texts(cells)
     cells = recover_empty_vertical_headers(
         image,
