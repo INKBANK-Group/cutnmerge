@@ -56,6 +56,9 @@ _BODY_INDEX_LABEL_RE = re.compile(
 # 组合物父表头 vs 颜料分散液：禁止逻辑重叠时互相拼字
 _COMPOSITION_SPAN_HEADER_RE = re.compile(r"组成\s*[\[［]?\s*质量")
 _COMPOSITION_PARENT_HDR_RE = re.compile(r"^组合物$")
+# OCR 把侧栏「组合物」与顶栏「组成[…」粘在同一格
+_GLUED_COMP_PARENT_SPAN_RE = re.compile(r"^组合物\s*组成")
+_MASS_PARTS_LEADING_RE = re.compile(r"^质量\s*份")
 _ACID_CONTENT_HDR_RE = re.compile(r"酸\s*的?\s*含量")
 _TALL_METRIC_NMP_RE = re.compile(r"NMP")
 _FORMULA_HDR_TOKEN_RE = re.compile(r"通\s*式")
@@ -249,6 +252,16 @@ def _place_cell_rect(
 def _monomer_subheader_merge_forbidden(a: str, b: str) -> bool:
     """「单体[…]」父格与中段子表头不得互相拼字（P97）；共聚子头异类也不拼（P47）。"""
     mon = re.compile(r"单体\s*[\[［]")
+    poly = re.compile(r"聚合物")
+    # 聚合物 ↔ 单体：禁止拼成「聚合物 单体[mol比]」
+    if (poly.search(a) and mon.search(b)) or (poly.search(b) and mon.search(a)):
+        return True
+    # 侧栏（分子量/当量）↔ 单体：禁止拼字
+    side = re.compile(
+        r"(重量?平均分子量|重均分子量|数均分子量|平均分子量|酸当量|双键当量)"
+    )
+    if (side.search(a) and mon.search(b)) or (side.search(b) and mon.search(a)):
+        return True
     sub = re.compile(
         r"(二羧酸|双氨基|封端剂|三官能|四官能|四羧酸|二胺及其|二羟基|二甲酰|有机硅烷)"
     )
@@ -673,6 +686,120 @@ def _first_example_data_column(cells: Sequence[Dict[str, Any]]) -> Optional[int]
     return first
 
 
+def _is_short_row_label_for_colspan_clip(text: str) -> bool:
+    """仅短行头标签才允许按身列数据拆 colspan；中段换栏长描述/说明宽格不拆。"""
+    t = str(text or "").strip()
+    if not t:
+        return False
+    compact = "".join(t.split())
+    if len(compact) > 16:
+        return False
+    if re.search(r"[；;。、]", t):
+        return False
+    if "说明" in compact or "结构单元" in compact:
+        return False
+    if compact.endswith("结构"):
+        return False
+    return True
+
+
+def _extend_sparse_section_trailing_colspans(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    中段换栏：连续身行呈「左标签 + 已跨多列的右侧宽格」，且本段尾列全空时，
+    将右侧宽格扩到表宽（修 TSR 宽格少盖末列 / 误拆后空尾列）。
+    """
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    max_col = max(int(c["col_end"]) for c in cells)
+    if max_col < 2:
+        return cells
+
+    by_row: Dict[int, List[Dict[str, Any]]] = {}
+    for c in cells:
+        if c.get("_drop_render"):
+            continue
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if rs != re or rs <= header_end:
+            continue
+        by_row.setdefault(rs, []).append(c)
+    if len(by_row) < 2:
+        return cells
+
+    def _sparse_wide_pair(
+        row_cells: List[Dict[str, Any]],
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        filled = [c for c in row_cells if str(c.get("text") or "").strip()]
+        if len(filled) != 2:
+            return None
+        left, right = sorted(filled, key=lambda x: int(x["col_start"]))
+        if int(left["col_start"]) > 0:
+            return None
+        if int(right["col_start"]) < 1:
+            return None
+        if int(right["col_end"]) - int(right["col_start"]) < 2:
+            return None
+        for c in row_cells:
+            if c is left or c is right:
+                continue
+            if str(c.get("text") or "").strip():
+                return None
+        return left, right
+
+    body_rows = sorted(by_row.keys())
+    sparse_flags = {r: _sparse_wide_pair(by_row[r]) is not None for r in body_rows}
+    runs: List[Tuple[int, int]] = []
+    run_lo: Optional[int] = None
+    run_hi = -1
+    for r in body_rows:
+        if sparse_flags[r]:
+            if run_lo is None:
+                run_lo = r
+            run_hi = r
+        elif run_lo is not None:
+            if run_hi > run_lo:
+                runs.append((run_lo, run_hi))
+            run_lo = None
+    if run_lo is not None and run_hi > run_lo:
+        runs.append((run_lo, run_hi))
+
+    changed = 0
+    for r0, r1 in runs:
+        for r in range(r0, r1 + 1):
+            pair = _sparse_wide_pair(by_row[r])
+            if pair is None:
+                continue
+            _left, right = pair
+            old_ce = int(right["col_end"])
+            if old_ce >= max_col:
+                continue
+            trail_busy = False
+            for rr in range(r0, r1 + 1):
+                for c in by_row[rr]:
+                    if int(c["col_start"]) <= old_ce:
+                        continue
+                    if str(c.get("text") or "").strip():
+                        trail_busy = True
+                        break
+                if trail_busy:
+                    break
+            if trail_busy:
+                continue
+            right["col_end"] = max_col
+            right["col_span"] = max_col - int(right["col_start"]) + 1
+            for c in by_row[r]:
+                if c is right:
+                    continue
+                if int(c["col_start"]) > old_ce and not str(c.get("text") or "").strip():
+                    c["_drop_render"] = True
+            changed += 1
+    if changed:
+        logger.info("中段换栏尾列扩 colspan: %d 格 → col_end=%d", changed, max_col)
+    return cells
+
+
 def _split_label_over_data_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     身行标签 colspan 盖住其他行已有数字的数据列时，收到左缘并补空格。
@@ -697,7 +824,10 @@ def _split_label_over_data_columns(cells: List[Dict[str, Any]]) -> List[Dict[str
             continue
         if (cs, ce) in aligned:
             continue
-        if not str(cell.get("text") or "").strip():
+        text = str(cell.get("text") or "").strip()
+        if not text:
+            continue
+        if not _is_short_row_label_for_colspan_clip(text):
             continue
         clip_end = cs
         hit_data = False
@@ -2055,14 +2185,144 @@ def _restore_composition_parent_header(
     return cells
 
 
-def _extend_composition_parent_colspan(
+def _unglue_composition_side_and_span(
     cells: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """「组合物」父头应覆盖同行/下一行的 (A)(B)(C) 子列，含左侧误空的 (A) 树脂列。"""
+    """拆开表头 OCR 粘连的「组合物」+「组成[质量份]」。
+
+    常见形态：一格 ``组合物组成[``，右邻 ``质量份]…`` → 侧栏「组合物」+
+    「组成[质量份]」，右邻剩余行保留。
+    """
     if not cells:
         return cells
     header_end = _top_header_band_end(cells)
-    if header_end < 2:
+    if header_end < 0:
+        return cells
+    work = [dict(c) for c in cells]
+    changed = 0
+    for cell in work:
+        if cell.get("_drop_render"):
+            continue
+        if int(cell["row_start"]) > header_end:
+            continue
+        raw = str(cell.get("text") or "").strip()
+        compact = "".join(raw.split())
+        if not _GLUED_COMP_PARENT_SPAN_RE.match(compact):
+            continue
+        # 整段已在一格：组合物组成[质量份]
+        if _COMPOSITION_SPAN_HEADER_RE.search(compact):
+            cs, ce = int(cell["col_start"]), int(cell["col_end"])
+            if ce > cs:
+                # 左列留侧栏，右段作组成父头
+                mid = cs
+                left = dict(cell)
+                left["col_end"] = mid
+                left["col_span"] = mid - cs + 1
+                left["text"] = "组合物"
+                _refresh_cell_spans(left)
+                cell["col_start"] = mid + 1
+                cell["col_span"] = ce - (mid + 1) + 1
+                cell["text"] = "组成[质量份]"
+                _refresh_cell_spans(cell)
+                work.append(left)
+                changed += 1
+            else:
+                cell["text"] = "组合物"
+                changed += 1
+            continue
+        # 组合物组成[ + 右邻质量份]
+        cell["text"] = "组合物"
+        changed += 1
+        rs = int(cell["row_start"])
+        ce = int(cell["col_end"])
+        for nb in work:
+            if nb is cell or nb.get("_drop_render"):
+                continue
+            if int(nb["row_start"]) != rs:
+                continue
+            if int(nb["col_start"]) > ce + 1:
+                continue
+            if int(nb["col_end"]) < ce:
+                continue
+            nlines = [ln.strip() for ln in str(nb.get("text") or "").split("\n") if ln.strip()]
+            if not nlines:
+                continue
+            if not _MASS_PARTS_LEADING_RE.match("".join(nlines[0].split())):
+                continue
+            rest = nlines[1:]
+            nb["text"] = "组成[质量份]" + (("\n" + "\n".join(rest)) if rest else "")
+            logger.info(
+                "组合物/组成粘连拆分: → 组合物 | %r",
+                nb["text"].split("\n")[0],
+            )
+            break
+    if changed:
+        logger.info("组合物/组成粘连拆分: %d 处", changed)
+    return [c for c in work if not c.get("_drop_render")]
+
+
+def _merge_split_composition_span_fragments(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """合并被 OCR 切开的「组成[」+「质量份]」相邻表头格。"""
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 0:
+        return cells
+    work = [dict(c) for c in cells]
+    changed = 0
+    for cell in work:
+        if cell.get("_drop_render"):
+            continue
+        if int(cell["row_start"]) > header_end:
+            continue
+        t = "".join(str(cell.get("text") or "").split())
+        # 「组成[」或缺「质量」的残段
+        if not (
+            re.match(r"^组成[\[［]?$", t)
+            or (t.startswith("组成") and "质量" not in t and ("[" in t or "［" in t))
+        ):
+            continue
+        rs = int(cell["row_start"])
+        ce = int(cell["col_end"])
+        for nb in work:
+            if nb is cell or nb.get("_drop_render"):
+                continue
+            if int(nb["row_start"]) != rs:
+                continue
+            if int(nb["col_start"]) != ce + 1:
+                continue
+            nt = "".join(str(nb.get("text") or "").split())
+            if not (nt.startswith("质量份") or re.match(r"^质量\s*份", str(nb.get("text") or "").strip())):
+                continue
+            cell["text"] = "组成[质量份]"
+            cell["col_end"] = int(nb["col_end"])
+            _refresh_cell_spans(cell)
+            nb["_drop_render"] = True
+            changed += 1
+            logger.info(
+                "组成[质量份]碎片合并: c%d-%d",
+                int(cell["col_start"]),
+                int(cell["col_end"]),
+            )
+            break
+    if changed:
+        return [c for c in work if not c.get("_drop_render")]
+    return work
+
+
+def _extend_composition_parent_colspan(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """「组合物」/「组成[质量份]」父头应覆盖 (A)(B)/(D)(E) 子列。
+
+    侧栏竖排「组合物」(rowspan>1 且 colspan=1) 不是顶栏父头，禁止横向扩展。
+    """
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if header_end < 1:
         return cells
     work = [dict(c) for c in cells]
     top_row = min(int(c["row_start"]) for c in work if not c.get("_drop_render"))
@@ -2072,12 +2332,25 @@ def _extend_composition_parent_colspan(
         if int(parent["row_start"]) > header_end:
             continue
         t = str(parent.get("text") or "").strip()
-        if not t or not _COMPOSITION_PARENT_HDR_RE.match("".join(t.split())):
+        compact = "".join(t.split())
+        is_span = bool(_COMPOSITION_SPAN_HEADER_RE.search(t))
+        is_parent = bool(_COMPOSITION_PARENT_HDR_RE.match(compact))
+        if not t or not (is_span or is_parent):
             continue
         pr = int(parent["row_start"])
         pc_s, pc_e = int(parent["col_start"]), int(parent["col_end"])
+        # 侧栏标签：跨表头行、单列 → 勿当顶栏父头扩展
+        if is_parent and not is_span and int(parent["row_end"]) > pr and pc_e == pc_s:
+            continue
+        # 剥开误粘字母叶子（组成[质量份] + （D）着色剂）
+        if is_span:
+            lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+            if len(lines) >= 2 and _lettered_parent_letter(lines[1]):
+                parent["text"] = lines[0]
+                t = parent["text"]
+                parent["row_end"] = pr
+                _refresh_cell_spans(parent)
         letter_cols: List[int] = []
-        # (A)(B)(C) 可能在 parent 同行或下一行（P42: A 在下一行）
         search_rows = {pr, pr + 1, pr - 1}
         search_rows = {r for r in search_rows if 0 <= r <= header_end}
         for c in work:
@@ -2087,15 +2360,69 @@ def _extend_composition_parent_colspan(
             if cr not in search_rows:
                 continue
             col = int(c["col_start"])
-            if col < pc_s - 4 or col > pc_e + 2:
+            if col < pc_s - 4 or col > pc_e + 4:
                 continue
             if _lettered_parent_letter(str(c.get("text") or "")):
                 letter_cols.append(col)
-        if len(letter_cols) < 2:
+        # 组成[质量份] 顶行右侧空邻格纳入覆盖
+        if is_span and int(parent["row_start"]) == pr == int(parent["row_end"]):
+            for c in work:
+                if c.get("_drop_render") or c is parent:
+                    continue
+                if int(c["row_start"]) != pr or int(c["row_end"]) != pr:
+                    continue
+                if str(c.get("text") or "").strip():
+                    continue
+                cs, ce = int(c["col_start"]), int(c["col_end"])
+                if cs == pc_e + 1 or (cs <= pc_e + 1 and ce >= pc_e + 1):
+                    letter_cols.extend(range(cs, ce + 1))
+        letter_cols = sorted(set(letter_cols))
+        if not letter_cols:
             continue
-        letter_cols.sort()
+        if not is_span and len(letter_cols) < 2:
+            continue
+        # 组合物：字母列已由「组成[质量份]」覆盖 → 勿抢占
+        if is_parent and not is_span:
+            covered_by_compose = False
+            for c in work:
+                if c.get("_drop_render") or c is parent:
+                    continue
+                if int(c["row_start"]) > header_end:
+                    continue
+                ct = "".join(str(c.get("text") or "").split())
+                if not _COMPOSITION_SPAN_HEADER_RE.search(ct):
+                    continue
+                ccs, cce = int(c["col_start"]), int(c["col_end"])
+                if letter_cols[0] >= ccs and letter_cols[-1] <= cce:
+                    covered_by_compose = True
+                    break
+            if covered_by_compose:
+                continue
         new_cs = min(pc_s, letter_cols[0])
         new_ce = max(pc_e, letter_cols[-1])
+        if new_cs == pc_s and new_ce == pc_e and (
+            not is_span or int(parent["row_end"]) == pr
+        ):
+            if int(parent["row_start"]) <= top_row:
+                continue
+        # 勿扩进同行其它非空顶栏父头所占列
+        blocked = False
+        for c in work:
+            if c.get("_drop_render") or c is parent:
+                continue
+            if int(c["row_start"]) != pr:
+                continue
+            ot = str(c.get("text") or "").strip()
+            if not ot:
+                continue
+            ocs, oce = int(c["col_start"]), int(c["col_end"])
+            if oce < new_cs or ocs > new_ce:
+                continue
+            if ocs > pc_e or oce < pc_s:
+                blocked = True
+                break
+        if blocked:
+            continue
         changed = False
         if new_cs != pc_s or new_ce != pc_e:
             parent["col_start"] = new_cs
@@ -2104,11 +2431,28 @@ def _extend_composition_parent_colspan(
         if int(parent["row_start"]) > top_row:
             parent["row_start"] = top_row
             changed = True
+        if is_span and int(parent["row_end"]) > pr:
+            parent["row_end"] = pr
+            changed = True
         if changed:
             _refresh_cell_spans(parent)
-            logger.info("组合物父头扩展: r%d c%d-%d", int(parent["row_start"]), new_cs, new_ce)
+            for c in work:
+                if c.get("_drop_render") or c is parent:
+                    continue
+                if int(c["row_start"]) != int(parent["row_start"]):
+                    continue
+                if str(c.get("text") or "").strip():
+                    continue
+                cs, ce = int(c["col_start"]), int(c["col_end"])
+                if cs >= int(parent["col_start"]) and ce <= int(parent["col_end"]):
+                    c["_drop_render"] = True
+            logger.info(
+                "组成/组合物父头扩展: r%d c%d-%d",
+                int(parent["row_start"]),
+                int(parent["col_start"]),
+                int(parent["col_end"]),
+            )
     return work
-
 
 def _ensure_composition_parent_header(
     cells: List[Dict[str, Any]],
@@ -3023,6 +3367,18 @@ def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]
             for c in covered
         ):
             continue
+        # 分组父头下的叶子单元列（…单元 / …结构）：表体可全空/稀疏，不可当幽灵列删
+        # （否则会把「聚苯并噁唑单元|前体|聚酰胺酰亚胺」并进邻列）
+        if header_anchor:
+            from ..structure.header_topology import looks_like_leaf_unit_header
+
+            if any(
+                int(c["col_start"]) == col
+                and int(c["row_start"]) <= header_end
+                and looks_like_leaf_unit_header(str(c.get("text") or ""))
+                for c in covered
+            ):
+                continue
         # 仅含括号单位、右侧邻列有表体数据 → 幽灵列（单位文本并入右侧）
         unit_texts = [
             str(c.get("text") or "").strip()
@@ -3793,13 +4149,11 @@ def _normalize_nested_column_group_headers(
     if not cells:
         return cells
 
-    from ..structure.hline_repair import (
-        repair_parent_header_shard_colspans,
-        _nested_header_parent_sub_rows,
-    )
+    from ..structure.hline_repair import _nested_header_parent_sub_rows
+    from ..structure.header_topology import repair_parent_header_topology
     from ..structure.tsr_refine import _derive_seps as _derive_seps_hr
 
-    work = repair_parent_header_shard_colspans(cells, [])
+    work = repair_parent_header_topology(cells, [])
 
     header_end = _top_header_band_end(work)
     if header_end < 1:
@@ -4082,6 +4436,11 @@ def _looks_like_wrapped_header_lines(
     # 室温放置 + 显影/感度叶子：独立上下格
     if _is_room_storage_over_eval_leaf(parts[0], "\n".join(parts[1:])):
         return False
+    # 组成[质量份] + （D）着色剂：独立上下格，非折行
+    if _is_composition_span_parent(parts[0]) and _lettered_parent_letter(
+        "\n".join(parts[1:])
+    ):
+        return False
     # 折行数多于 rowspan：不可能是「每行一标签」
     if len(parts) > row_span:
         return True
@@ -4236,7 +4595,7 @@ def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str
 
 _TRUNCATED_HEADER_TAIL_RE = re.compile(r"(的|中|与|及|、)$")
 _HEADER_CONTINUATION_HEAD_RE = re.compile(
-    r"^(置\d*日后|NMP|浓度|含量|质量|[×xX]\s*10|\(|（)",
+    r"^(置\d*日后|NMP|浓度|含量|质量|[×xX]\s*10)",
     re.IGNORECASE,
 )
 
@@ -4253,6 +4612,11 @@ def _is_truncated_header_prefix(text: str) -> bool:
     return bool(_TRUNCATED_HEADER_TAIL_RE.search(t))
 
 
+def _is_composition_span_parent(text: str) -> bool:
+    """「组成[质量份]」类顶栏父头（含误粘字母叶子后的多行文本）。"""
+    return bool(_COMPOSITION_SPAN_HEADER_RE.search(text or ""))
+
+
 def _is_header_phrase_continuation(upper: str, lower: str) -> bool:
     """下格是上格折行续文（单位、浓度、半截词等）。"""
     # (B)组分名 / 种类(量) 是父子表头，不是折行
@@ -4264,9 +4628,21 @@ def _is_header_phrase_continuation(upper: str, lower: str) -> bool:
     u, l = _compact_hdr(upper), _compact_hdr(lower)
     if not l:
         return True
+    # （D）着色剂 等字母叶子：相对组成/非字母父头绝非折行续文
+    if _lettered_parent_letter(l) and not _lettered_parent_letter(u):
+        return False
+    if _is_composition_span_parent(u) and _lettered_parent_letter(l):
+        return False
     if _is_header_unit_line(lower):
         return True
     if _HEADER_CONTINUATION_HEAD_RE.match(l):
+        # 裸括号开头：仅单位行（℃）等可续；字母组分叶子已在上方排除
+        if l.startswith("(") or l.startswith("（"):
+            if _is_header_unit_line(lower):
+                return True
+            if re.match(r"^[\(（][^）\)]*[\)）]$", l):
+                return True
+            return False
         return True
     if _is_truncated_header_prefix(u):
         cjk = len(re.findall(r"[\u4e00-\u9fff]", l))
@@ -4282,6 +4658,10 @@ def _looks_like_wrapped_header_pair(upper: str, lower: str) -> bool:
     if _is_lettered_parent_over_leaf_subheader(upper, lower):
         return False
     if _is_room_storage_over_eval_leaf(upper, lower):
+        return False
+    if _is_composition_span_parent(upper) and _lettered_parent_letter(lower):
+        return False
+    if _lettered_parent_letter(lower) and not _lettered_parent_letter(upper):
         return False
     if _is_header_phrase_continuation(upper, lower):
         return True
@@ -4592,10 +4972,16 @@ def cells_to_html_table(
     work = _repair_lone_example_number_headers(work)
     work = _drop_leading_header_only_columns(work)
     work = _split_label_over_data_columns(work)
+    work = _extend_sparse_section_trailing_colspans(work)
     work = _split_header_over_index_column(work)
+    work = _unglue_composition_side_and_span(work)
+    work = _merge_split_composition_span_fragments(work)
     work = _collapse_header_empty_corners(work)
     work = drop_evidenceless_columns(work)
     work = _align_orphan_left_anchor_headers(work)
+    from ..structure.header_topology import repair_parent_header_topology
+
+    work = repair_parent_header_topology(work, [])
     work = _drop_body_empty_columns(work)
     work = _merge_leading_empty_into_label(work)
     work = _merge_leading_label_gaps(work)
@@ -4613,9 +4999,9 @@ def cells_to_html_table(
     work = _merge_header_unit_rows(work)
     work = _normalize_nested_column_group_headers(work)
     work = _normalize_tiered_column_headers(work)
-    from ..structure.hline_repair import repair_parent_header_shard_colspans
+    from ..structure.header_topology import repair_parent_header_topology as _topo_late
 
-    work = repair_parent_header_shard_colspans(work, [])
+    work = _topo_late(work, [])
     work = _merge_formula_parent_colspans(work)
     work = _ensure_composition_parent_header(work)
     work = _extend_composition_parent_colspan(work)
@@ -4624,6 +5010,8 @@ def cells_to_html_table(
     work = _repair_room_storage_eval_headers(work)
     work = _fold_acid_times_shard_column(work)
     work = _merge_header_empty_below(work)
+    work = _extend_composition_parent_colspan(work)
+    work = _extend_sparse_section_trailing_colspans(work)
     work = _repair_room_storage_eval_headers(work)
     work = [c for c in work if not c.get("_drop_render")]
     if not work:
