@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
@@ -350,6 +351,14 @@ def cells_to_markdown_table(
     return "\n\n".join(md_parts)
 
 
+def _caption_norm_key(text: str) -> str:
+    """题注归一化键（忽略括号全半角差异）。"""
+    m = _HEADER_CAPTION_RE.search(text or "")
+    if not m:
+        return ""
+    return re.sub(r"[\[\]［］【】\s]", "", m.group(0)).casefold()
+
+
 def format_free_texts(free_texts: List[Dict[str, Any]]) -> str:
     """游离文本按阅读顺序（先 Y 后 X）拼接为前缀段落。"""
     if not free_texts:
@@ -362,7 +371,19 @@ def format_free_texts(free_texts: List[Dict[str, Any]]) -> str:
         return (0.0, 0.0)
 
     ordered = sorted(free_texts, key=sort_key)
-    return "\n".join(tb["text"] for tb in ordered if tb.get("text"))
+    seen_captions: set[str] = set()
+    lines: List[str] = []
+    for tb in ordered:
+        text = str(tb.get("text") or "").strip()
+        if not text:
+            continue
+        cap_key = _caption_norm_key(text)
+        if cap_key:
+            if cap_key in seen_captions:
+                continue
+            seen_captions.add(cap_key)
+        lines.append(text)
+    return "\n".join(lines)
 
 
 def build_markdown_output(

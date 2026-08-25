@@ -968,6 +968,8 @@ def _explode_colspan_cell(
     将 col_span>1 的单元格拆成逐列原子格，返回 {col_start: new_cell_idx}。
 
     用于跨列表头切分后能把片段写进不同逻辑列。
+    已归属的 texts 按文本框中心 X 重新分配，避免拆格时丢掉上行折行
+    （如「通式(5)、通式」落在父头宽格内后被 wipe）。
     """
     cell = cells[cell_idx]
     cs = int(cell["col_start"])
@@ -981,6 +983,7 @@ def _explode_colspan_cell(
     re = int(cell["row_end"])
     cb = _cell_bbox(cell)
     y1, y2 = cb[1], cb[3]
+    old_texts = list(cell.get("texts") or [])
 
     mapping: Dict[int, int] = {}
     first = True
@@ -988,6 +991,7 @@ def _explode_colspan_cell(
         x1 = float(col_seps[c])
         x2 = float(col_seps[c + 1])
         new_cell = _make_atomic_cell(x1, y1, x2, y2, rs, re, c, c)
+        new_cell["texts"] = []
         if first:
             cells[cell_idx] = new_cell
             mapping[c] = cell_idx
@@ -995,6 +999,22 @@ def _explode_colspan_cell(
         else:
             cells.append(new_cell)
             mapping[c] = len(cells) - 1
+
+    # 把原宽格已归属文本按中心 X 归入对应原子列；无法落入时挂到首列
+    fallback_idx = mapping.get(cs, cell_idx)
+    for tb in old_texts:
+        bx1, _by1, bx2, _by2 = _text_bbox(tb)
+        cx = 0.5 * (bx1 + bx2)
+        placed = False
+        for c in range(cs, ce + 1):
+            x1 = float(col_seps[c])
+            x2 = float(col_seps[c + 1])
+            if x1 - 1 <= cx <= x2 + 1:
+                cells[mapping[c]].setdefault("texts", []).append(tb)
+                placed = True
+                break
+        if not placed:
+            cells[fallback_idx].setdefault("texts", []).append(tb)
     return mapping
 
 

@@ -14,11 +14,13 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from .formatter import (
+    _caption_norm_key,
     extract_caption_row,
     format_free_texts,
     split_cells_into_subtables,
 )
 from ..structure.row_header import is_physically_right_child
+from ..utils.segments import _HEADER_CAPTION_RE
 from ..utils.label_patterns import (
     is_index_column,
     parse_clean_example_label,
@@ -892,6 +894,21 @@ def _split_header_over_index_column(cells: List[Dict[str, Any]]) -> List[Dict[st
     if _left_cols_have_rowspan_body_labels(cells, 1, header_end):
         return cells
 
+    max_col = max(int(c["col_end"]) for c in cells)
+
+    def _skip_index_split(cell: Dict[str, Any]) -> bool:
+        """整行题注 / 全宽表头不得按索引列角拆分。"""
+        text = str(cell.get("text") or "").strip()
+        if text and _HEADER_CAPTION_RE.search(text):
+            return True
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        width = ce - cs + 1
+        if width >= max(max_col, 1) - 1:
+            return True
+        if not text and width >= max(max_col + 1, 4) // 2:
+            return True
+        return False
+
     extras: List[Dict[str, Any]] = []
     changed = 0
     for cell in cells:
@@ -902,6 +919,8 @@ def _split_header_over_index_column(cells: List[Dict[str, Any]]) -> List[Dict[st
         if cs > 0 or ce <= cs:
             continue
         if not str(cell.get("text") or "").strip():
+            continue
+        if _skip_index_split(cell):
             continue
         bbox = _cell_physical_bbox_x_y(cell)
         x1, y1, x2, y2 = bbox
@@ -1227,6 +1246,13 @@ def _cell_physical_bbox_x_y(cell: Dict[str, Any]) -> Tuple[float, float, float, 
     return float(poly[:, 0].min()), float(poly[:, 1].min()), float(poly[:, 0].max()), float(poly[:, 1].max())
 
 
+_KNOWN_LEAF_SUBHEADER_RE = re.compile(
+    r"^(种类|类型|名称|组分|品种|项目|序号|牌号|"
+    r"量|添加量|含量|用量|摩尔|质量|份数)"
+    r"(?:[\(（].*)?$"
+)
+
+
 def _is_cell_frag(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -1235,12 +1261,50 @@ def _is_cell_frag(text: str) -> bool:
     # 单字母等级代号是表体数据，不是空角碎片
     if _LETTER_DATA_RE.fullmatch(compact):
         return False
+    if _is_known_leaf_subheader(t):
+        return False
     if len(compact) <= 2:
         # 两汉字表体/表头词（溶解/不溶等）
         if re.fullmatch(r"[\u4e00-\u9fff]{2}", compact):
             return False
         return True
     return False
+
+
+def _is_known_leaf_subheader(text: str) -> bool:
+    """种类 / 量(g) / 含量 等短子表头，不可当碎片被同宽模板盖掉。"""
+    compact = "".join((text or "").split())
+    if not compact:
+        return False
+    if _KNOWN_LEAF_SUBHEADER_RE.match(compact):
+        return True
+    return bool(re.search(r"(pKa|保护率|反应率)", compact, re.I))
+
+
+def _is_leaf_type_amount_subheader(text: str) -> bool:
+    """叶子「种类 / 量 / 种类(量)」类子表头（可多行，如 种类\\n(量)）。"""
+    lines = [ln.strip() for ln in (text or "").split("\n") if ln.strip()]
+    if not lines:
+        return False
+    joined = "".join("".join(ln.split()) for ln in lines)
+    if not re.search(r"(种类|类型|名称|量|含量|用量|添加量)", joined):
+        return False
+    for ln in lines:
+        compact = "".join(ln.split())
+        if _KNOWN_LEAF_SUBHEADER_RE.match(compact):
+            continue
+        # 单独一行的 (量) / (g) 等括号量注
+        if re.fullmatch(r"[\(（][^）\)]{0,12}[\)）]", compact):
+            continue
+        return False
+    return True
+
+
+def _is_lettered_parent_over_leaf_subheader(upper: str, lower: str) -> bool:
+    """(B)光酸产生剂 与下方 种类(量) → 应保持上下两格，不是同一短语折行。"""
+    if not _lettered_parent_letter(upper):
+        return False
+    return _is_leaf_type_amount_subheader(lower)
 
 
 def _merge_text_into_cell(cell: Dict[str, Any], text: str) -> None:
@@ -3274,6 +3338,11 @@ def _looks_like_wrapped_header_lines(
     """\\n 多行是单格内折行（如竖向长表头），不是每行一个独立表头。"""
     if len(parts) <= 1:
         return False
+    # 字母组分父头 + 种类/量 叶子：独立上下格，非折行
+    if _lettered_parent_letter(parts[0]) and _is_leaf_type_amount_subheader(
+        "\n".join(parts[1:])
+    ):
+        return False
     # 折行数多于 rowspan：不可能是「每行一标签」
     if len(parts) > row_span:
         return True
@@ -3294,6 +3363,9 @@ def _looks_like_wrapped_header_lines(
         if not re.search(r"[\u4e00-\u9fff]", a) or not re.search(r"[\u4e00-\u9fff]", b):
             continue
         if _looks_like_independent_header_label(a) and _looks_like_independent_header_label(b):
+            continue
+        # 字母父头即使 ≤8 字也不是折行前缀（如 （B）光酸产生剂）
+        if _lettered_parent_letter(a):
             continue
         combined = a + b
         if len(a) <= 8 and _WRAP_HEADER_SUFFIX_RE.search(combined):
@@ -3316,7 +3388,10 @@ def _looks_like_independent_stacked_header_lines(
 
 
 def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """表头带内 rowspan>1 且叠放独立中文标签 → 按行拆成上下两格（如添加剂/热产碱剂）。"""
+    """表头带内 rowspan>1 且叠放独立中文标签 → 按行拆成上下两格（如添加剂/热产碱剂）。
+
+    亦拆「(B)光酸产生剂\\n种类\\n(量)」这类字母父头 + 叶子子表头。
+    """
     if not cells:
         return cells
     header_end = _top_header_band_end(cells)
@@ -3330,18 +3405,52 @@ def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str
             continue
         if int(c["col_start"]) != int(c["col_end"]):
             continue
-        if _lettered_parent_letter(str(c.get("text") or "")):
-            continue
-        parts = [p.strip() for p in str(c.get("text") or "").split("\n") if p.strip()]
+        raw = str(c.get("text") or "")
+        parts = [p.strip() for p in raw.split("\n") if p.strip()]
         row_span = re - rs + 1
         if len(parts) < 2:
             continue
-        if not all(_is_stacked_header_label(p) for p in parts):
+        lettered_leaf_split = bool(
+            _lettered_parent_letter(parts[0])
+            and _is_leaf_type_amount_subheader("\n".join(parts[1:]))
+        )
+        if _lettered_parent_letter(raw) and not lettered_leaf_split:
             continue
-        if not _looks_like_independent_stacked_header_lines(parts, row_span):
-            continue
+        if not lettered_leaf_split:
+            if not all(_is_stacked_header_label(p) for p in parts):
+                continue
+            if not _looks_like_independent_stacked_header_lines(parts, row_span):
+                continue
         n_parts = min(len(parts), re - rs + 1)
         if n_parts < 2:
+            continue
+        # 字母父头：上行保留父名，其余叶子行合并进最后一格（种类+(量)）
+        if lettered_leaf_split and n_parts >= 2:
+            leaf_joined = "\n".join(parts[1:])
+            split_parts = [parts[0], leaf_joined]
+            n_parts = 2
+            # 父头只占首行，叶子占剩余行
+            c["text"] = split_parts[0]
+            c["row_end"] = rs
+            _refresh_cell_spans(c)
+            bbox = _cell_physical_bbox_x_y(c)
+            cs, ce = int(c["col_start"]), int(c["col_end"])
+            pool = work + added
+            leaf_row = rs + 1
+            # 叶子可跨到原 row_end
+            slot = _atomic_header_at(pool, leaf_row, cs)
+            if slot is not None and slot is not c:
+                if not str(slot.get("text") or "").strip():
+                    slot["text"] = split_parts[1]
+                    slot["row_end"] = re
+                    _refresh_cell_spans(slot)
+                continue
+            new_c = _empty_atomic_from_bbox(c, cs, cs, ce, bbox)
+            new_c["row_start"] = leaf_row
+            new_c["row_end"] = re
+            new_c["row_span"] = re - leaf_row + 1
+            new_c["text"] = split_parts[1]
+            added.append(new_c)
             continue
         cs, ce = int(c["col_start"]), int(c["col_end"])
         c["text"] = parts[0]
@@ -3366,6 +3475,63 @@ def _split_stacked_header_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str
         work.extend(added)
         logger.info("split_stacked_header_rowspans: 拆 %d 格", len(added))
     return work
+
+
+
+_TRUNCATED_HEADER_TAIL_RE = re.compile(r"(的|中|与|及|、)$")
+_HEADER_CONTINUATION_HEAD_RE = re.compile(
+    r"^(置\d*日后|NMP|浓度|含量|质量|[×xX]\s*10|\(|（)",
+    re.IGNORECASE,
+)
+
+
+def _compact_hdr(text: str) -> str:
+    return "".join((text or "").split())
+
+
+def _is_truncated_header_prefix(text: str) -> bool:
+    """上格像未写完的表头前缀（以的/中等收尾）。"""
+    t = _compact_hdr(text)
+    if not t or len(t) > 16:
+        return False
+    return bool(_TRUNCATED_HEADER_TAIL_RE.search(t))
+
+
+def _is_header_phrase_continuation(upper: str, lower: str) -> bool:
+    """下格是上格折行续文（单位、浓度、半截词等）。"""
+    # (B)组分名 / 种类(量) 是父子表头，不是折行
+    if _is_lettered_parent_over_leaf_subheader(upper, lower):
+        return False
+    u, l = _compact_hdr(upper), _compact_hdr(lower)
+    if not l:
+        return True
+    if _is_header_unit_line(lower):
+        return True
+    if _HEADER_CONTINUATION_HEAD_RE.match(l):
+        return True
+    if _is_truncated_header_prefix(u):
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", l))
+        if cjk <= 6 and not _looks_like_independent_header_label(l):
+            return True
+    if _looks_like_wrapped_header_lines([upper, lower], 2):
+        return True
+    return False
+
+
+def _looks_like_wrapped_header_pair(upper: str, lower: str) -> bool:
+    """上下非空标签像同一短语折行（非两个独立列头）。"""
+    if _is_lettered_parent_over_leaf_subheader(upper, lower):
+        return False
+    if _is_header_phrase_continuation(upper, lower):
+        return True
+    u, l = _compact_hdr(upper), _compact_hdr(lower)
+    if _looks_like_independent_header_label(u) and _looks_like_independent_header_label(l):
+        return False
+    if len(u) <= 8 and len(l) <= 8 and not _looks_like_independent_header_label(u):
+        if _lettered_parent_letter(u):
+            return False
+        return True
+    return False
 
 
 def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3431,18 +3597,11 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         uc_e = int(upper["col_end"])
         upper_text = str(upper.get("text") or "").strip()
 
-        # 只合并顶表头带内、且上方格为单行格的情况。
-        # 下一行若已出表头带（进入表体），不得把列头/数据格向下吞掉。
-        if ue != ur:
-            out.append(upper)
-            continue
+        # 只合并顶表头带内。下一行若已出表头带（进入表体），不得把列头/数据格向下吞掉。
         if ue + 1 > header_end:
             out.append(upper)
             continue
-        # 只处理单列表头：避免把诸如“组成[质量%]”(colspan>1) 的大格也错误向下延展
-        if uc_s != uc_e:
-            out.append(upper)
-            continue
+        is_colspan_parent = uc_s != uc_e
         if not upper_text or _is_frag_or_empty(upper_text):
             # 空角/碎片不在这里纵向合并：上下皆空就消横线会误伤「应保留的空角格线」。
             # 与右侧 rowspan 对齐的空角占位改由渲染阶段 _empty_td_rowspan_for_gap 处理。
@@ -3460,24 +3619,76 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
                     under_colspan_parent = True
                     break
 
-        # ==================== 【新增改动点 开始】 ====================
-        # 如果当前行（ur）同时存在其他 colspan > 1 的表头格（如 P40 中的“酸二酐 (colspan=3)”和“二胺 (colspan=5)”），
-        # 说明这一行属于多层级的“中间混合行”。
-        # 此时像“二苯基醚”这种被排版挤压断开的单列标签，其下方的“二甲酰氯”必定是同一格截断文本，
-        # 因此解除 under_colspan_parent 的拦截，允许它们垂直合并。
-        has_sibling_colspan = False
-        for c in cells:
-            if int(c["row_start"]) <= ur <= int(c["row_end"]):
-                if int(c.get("col_span", int(c["col_end"]) - int(c["col_start"]) + 1)) > 1:
-                    has_sibling_colspan = True
-                    break
-
-        if has_sibling_colspan:
-            under_colspan_parent = False
-        # ==================== 【新增改动点 结束】 ====================
+        # 同级 colspan 不再解除 under_colspan_parent：
+        # 否则会把「室温放置」中层碎片误 rowspan 进叶子行；折行续接在下方单独处理。
 
         # 实施例/比较例列头不得向下吞并（下层常为 A/B/C 等数据字母）
         if _EXAMPLE_COL_HEADER_RE.search(upper_text):
+            out.append(upper)
+            continue
+
+        # 跨空行找续文：组合物中的 →(空)→ NMP；酸的含量 →(空)→ 单位行。
+        # 即使 upper 已有 rowspan（TSR 先扩到空中层），仍可继续向下吞续文。
+        cont_cell = None
+        for look_row in range(ue + 1, header_end + 1):
+            cand = by_key.get((look_row, uc_s, uc_e))
+            if cand is None:
+                if _occupied_by_nonempty(look_row, uc_s, uc_e):
+                    break
+                continue
+            if id(cand) in dropped_ids:
+                break
+            ct = str(cand.get("text") or "").strip()
+            if not ct or _is_frag_or_empty(ct):
+                continue
+            if _is_header_phrase_continuation(upper_text, ct):
+                cont_cell = cand
+            break
+        if cont_cell is not None:
+            ct = str(cont_cell.get("text") or "").strip()
+            upper["text"] = upper_text + "\n" + ct if upper_text else ct
+            upper["row_end"] = int(cont_cell["row_end"])
+            upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+            dropped_ids.add(id(cont_cell))
+            cont_cell["_drop_render"] = True
+            for mid_r in range(ue + 1, int(cont_cell["row_start"])):
+                mid = by_key.get((mid_r, uc_s, uc_e))
+                if mid is not None and id(mid) not in dropped_ids:
+                    dropped_ids.add(id(mid))
+                    mid["_drop_render"] = True
+            out.append(upper)
+            continue
+
+        # colspan 父头：仅当中间行在本列范围内完全无非空格时，才向下扩 rowspan
+        # （通式…化合物 下空洞）；若范围内已有 (A)/(B) 等子头则不得吞掉。
+        if is_colspan_parent:
+            def _any_nonempty_overlap(next_row: int, cs: int, ce: int) -> bool:
+                for c in cells:
+                    if id(c) in dropped_ids or c is upper:
+                        continue
+                    rs, re = int(c["row_start"]), int(c["row_end"])
+                    if not (rs <= next_row <= re):
+                        continue
+                    ocs, oce = int(c["col_start"]), int(c["col_end"])
+                    if oce < cs or ocs > ce:
+                        continue
+                    if str(c.get("text") or "").strip():
+                        return True
+                return False
+
+            expand_to = ue
+            for look_row in range(ue + 1, header_end):
+                if _any_nonempty_overlap(look_row, uc_s, uc_e):
+                    break
+                expand_to = look_row
+            if expand_to > ue:
+                upper["row_end"] = expand_to
+                upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
+            out.append(upper)
+            continue
+
+        # 已有 rowspan 的格：除续文合并不再做空行扩展/叠字合并
+        if ue != ur:
             out.append(upper)
             continue
 
@@ -3494,28 +3705,39 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
                 if _lettered_parent_letter(upper_text):
                     out.append(upper)
                     continue
+                # colspan 父组下的中层格不要 rowspan 进叶子空位
+                if under_colspan_parent:
+                    out.append(upper)
+                    continue
+                # 残尾前缀先等续文，勿单独吞空行（否则挡掉更下方的 NMP/单位）
+                if _is_truncated_header_prefix(upper_text):
+                    out.append(upper)
+                    continue
                 upper["row_end"] = next_row
                 upper["row_span"] = int(upper["row_end"]) - int(upper["row_start"]) + 1
             out.append(upper)
             continue
 
         lower_text = str(lower.get("text") or "").strip()
+
         if not _is_frag_or_empty(lower_text):
             if (
                 _is_stacked_header_label(upper_text)
                 and _is_stacked_header_label(lower_text)
             ):
-                # 表头带顶/底两层独立标签（添加剂/热产碱剂）保持分列；
-                # P40 二苯基醚/二甲酰氯 在 colspan 父头下仍允许合并。
+                # 独立双标签保持分列；折行短语对才合并
                 if (
                     int(lower["row_start"]) == header_end
                     and ur < header_end
                     and int(lower["col_start"]) == uc_s
                     and not under_colspan_parent
+                    and not _looks_like_wrapped_header_pair(upper_text, lower_text)
                 ):
                     out.append(upper)
                     continue
-                if under_colspan_parent:
+                if under_colspan_parent and not _looks_like_wrapped_header_pair(
+                    upper_text, lower_text
+                ):
                     out.append(upper)
                     continue
                 upper["text"] = (
@@ -3528,6 +3750,15 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
                 dropped_ids.add(id(lower))
                 out.append(upper)
                 continue
+            out.append(upper)
+            continue
+
+        # 空/碎片下层：colspan 父头下的中层格不得 rowspan 进叶子行
+        if under_colspan_parent:
+            out.append(upper)
+            continue
+        # 残尾前缀不单独吞空行
+        if _is_truncated_header_prefix(upper_text):
             out.append(upper)
             continue
 
@@ -3754,6 +3985,20 @@ def cells_to_html(
     return "\n\n".join(parts)
 
 
+def _drop_duplicate_caption_paragraphs(table_html: str, prefix_keys: Set[str]) -> str:
+    """去掉与前缀 free_text 重复的表内题注段。"""
+    if not prefix_keys or not table_html:
+        return table_html
+    kept: List[str] = []
+    for line in table_html.split("\n"):
+        if line.startswith("<p>") and line.endswith("</p>"):
+            inner = html.unescape(line[3:-4])
+            if _caption_norm_key(inner) in prefix_keys:
+                continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def build_html_output(
     cells: List[Dict[str, Any]],
     free_texts: List[Dict[str, Any]],
@@ -3763,6 +4008,11 @@ def build_html_output(
 ) -> str:
     """游离文本前缀 + HTML 表格。结构失败时只输出游离文本块。"""
     prefix = format_free_texts(free_texts)
+    prefix_keys = {
+        _caption_norm_key(line)
+        for line in prefix.splitlines()
+        if _caption_norm_key(line)
+    }
     paras = [html.escape(line) for line in prefix.splitlines() if line.strip()] if prefix else []
     prefix_html = "\n".join(f"<p>{p}</p>" for p in paras)
 
@@ -3775,6 +4025,8 @@ def build_html_output(
         split_subtables=split_subtables,
         compress_empty=compress_empty,
     )
+    if prefix_keys:
+        table = _drop_duplicate_caption_paragraphs(table, prefix_keys)
     if prefix_html and table:
         return prefix_html + "\n\n" + table
     return prefix_html or table or ""

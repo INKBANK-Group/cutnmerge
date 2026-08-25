@@ -189,14 +189,47 @@ def _ocr_texts_in_bbox(
     bbox: Tuple[float, float, float, float],
 ) -> List[str]:
     x1, y1, x2, y2 = bbox
-    out: List[str] = []
+    hits: List[Tuple[float, float, str]] = []
     for tb in text_boxes:
         bx1, by1, bx2, by2 = _tb_bbox(tb)
         cx = 0.5 * (bx1 + bx2)
         cy = 0.5 * (by1 + by2)
         if x1 <= cx <= x2 and y1 <= cy <= y2:
-            out.append(str(tb.get("text") or "").strip())
-    return out
+            t = str(tb.get("text") or "").strip()
+            if t:
+                hits.append((cy, cx, t))
+    hits.sort(key=lambda h: (h[0], h[1]))
+    return [h[2] for h in hits]
+
+
+def _header_text_from_ocr_union(
+    text_boxes: Sequence[Dict[str, Any]],
+    bbox: Tuple[float, float, float, float],
+    fallback: str,
+) -> str:
+    """合并宽格后按阅读序回收 OCR；覆盖「通式…」落在父头内但未写入 cell.text 的情况。"""
+    parts = _ocr_texts_in_bbox(text_boxes, bbox)
+    if not parts:
+        return fallback
+    # 去重保序
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for p in parts:
+        key = _compact(p)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(p)
+    if not ordered:
+        return fallback
+    joined = "".join(ordered)
+    fb = _compact(fallback)
+    if not fb:
+        return "\n".join(ordered) if len(ordered) > 1 else ordered[0]
+    # OCR 更完整（含 fallback 且更长）时采用
+    if fb in _compact(joined) and len(_compact(joined)) > len(fb):
+        return "\n".join(ordered) if len(ordered) > 1 else ordered[0]
+    return fallback
 
 
 def _ocr_crosses_y_in_x(
@@ -635,6 +668,14 @@ _SUBHEADER_METRIC_RE = re.compile(
     r"(pKa|保护率|反应率|浓度|比率|比例|率[\(%）]|值[\(%）])",
     re.IGNORECASE,
 )
+# 通式/编号前缀折行：如「(6)的」+「化合物」
+_PARENT_FORMULA_PREFIX_RE = re.compile(r"^[（(]\d+[）)]的$")
+# 右半截续头：如「室温放」+「置0日后」
+_PARENT_CONT_HEAD_RE = re.compile(
+    r"^(置\d*日后|置后|后的|时的|日后)$"
+)
+# 左半截残尾：折行断开处
+_PARENT_INCOMPLETE_TAIL_RE = re.compile(r"(放|的|中|与|及|、)$")
 
 
 def _cell_header_text(
@@ -662,6 +703,83 @@ def _is_header_shard(text: str) -> bool:
     return True
 
 
+def _is_parent_header_fragment(text: str) -> bool:
+    """父表头横向折行碎片（含空槽、编号前缀、续头半截）。"""
+    t = _compact(text)
+    if not t:
+        return True
+    if _is_header_shard(t):
+        return True
+    if _PARENT_FORMULA_PREFIX_RE.match(t):
+        return True
+    if _PARENT_CONT_HEAD_RE.match(t):
+        return True
+    # 短残尾：「室温放」等（≤4 字且以不完整连接收尾）
+    if len(t) <= 4 and _PARENT_INCOMPLETE_TAIL_RE.search(t) and _CJK_RE.search(t):
+        if not _SUBHEADER_TYPE_RE.match(t) and not _SUBHEADER_AMOUNT_RE.match(t):
+            return True
+    return False
+
+
+def _are_mergeable_parent_shards(left: str, right: str) -> bool:
+    """相邻两格是否应拼为同一父表头（左右皆碎片，或左残尾+右续头）。
+
+    不跨短语边界：已完成的续头「置0日后」不得再并入下一组「室温放」。
+    """
+    lc, rc = _compact(left), _compact(right)
+    # 空槽可粘邻碎片
+    if not lc and _is_parent_header_fragment(right):
+        return True
+    if not rc and _is_parent_header_fragment(left):
+        return True
+    if not lc or not rc:
+        return False
+    # 右半截续头已收束 → 下一组左半截是新短语起点
+    if _PARENT_CONT_HEAD_RE.match(lc):
+        return False
+    # 左残尾 + 右续头：「室温放」+「置0日后」
+    if _PARENT_INCOMPLETE_TAIL_RE.search(lc) and _PARENT_CONT_HEAD_RE.match(rc):
+        return True
+    if _is_header_shard(lc) and _PARENT_CONT_HEAD_RE.match(rc):
+        return True
+    # 通式前缀 + 后半：「(6)的」+「化合物」
+    if _PARENT_FORMULA_PREFIX_RE.match(lc) and _is_parent_header_fragment(right):
+        return True
+    # 经典双短碎片：「酸催」+「化剂」
+    if _is_header_shard(lc) and _is_header_shard(rc):
+        return True
+    # 两侧皆碎片且左非已收束续头（空|残尾等）
+    if _is_parent_header_fragment(left) and _is_parent_header_fragment(right):
+        if _PARENT_INCOMPLETE_TAIL_RE.search(lc) or not lc:
+            return True
+    return False
+
+
+def _is_standalone_parent_header(cell: Dict[str, Any], text: str) -> bool:
+    """完整父表头组（非与邻列拼合的折行碎片）。"""
+    if max(int(cell.get("col_span") or 1), 1) > 1:
+        return True
+    t = _compact(text)
+    if not t:
+        return False
+    return not _is_parent_header_fragment(t)
+
+
+def _parent_labels_in_col_range(
+    cells: Sequence[Dict[str, Any]],
+    parent_row: int,
+    cs: int,
+    ce: int,
+    text_boxes: Sequence[Dict[str, Any]],
+) -> List[str]:
+    """父表头行各列起点文本（含 rowspan 父头）。"""
+    out: List[str] = []
+    for col in range(cs, ce + 1):
+        cell = _header_origin_at(cells, parent_row, col)
+        out.append(_cell_header_text(cell, text_boxes) if cell else "")
+    return out
+
+
 def _atomic_cell_at_row_col(
     cells: Sequence[Dict[str, Any]],
     row: int,
@@ -672,6 +790,20 @@ def _atomic_cell_at_row_col(
             int(c["row_start"]) == int(c["row_end"]) == row
             and int(c["col_start"]) == int(c["col_end"]) == col
         ):
+            return c
+    return None
+
+
+def _header_origin_at(
+    cells: Sequence[Dict[str, Any]],
+    row: int,
+    col: int,
+) -> Optional[Dict[str, Any]]:
+    """表头行 row 上、以 col 为起始列的格（含 rowspan>1 的父头起点）。"""
+    for c in cells:
+        if int(c["row_start"]) != row:
+            continue
+        if int(c["col_start"]) == col:
             return c
     return None
 
@@ -747,6 +879,38 @@ def _nested_header_parent_sub_rows(
     return parent_row, sub_row
 
 
+def _is_new_parent_phrase_start(
+    cells: Sequence[Dict[str, Any]],
+    parent_row: Optional[int],
+    col: int,
+    run_start: int,
+    text_boxes: Sequence[Dict[str, Any]],
+) -> bool:
+    """邻列已是新的同层父短语起点（置0日后|室温放），不得并入当前组。"""
+    if parent_row is None or col <= run_start:
+        return False
+    atom = _header_origin_at(cells, parent_row, col)
+    if atom is None:
+        cov = _cell_covering_row_col(cells, parent_row, col)
+        if cov is None or int(cov["col_start"]) != col:
+            return False
+        atom = cov
+    at = _cell_header_text(atom, text_boxes)
+    if not at:
+        return False
+    if _is_standalone_parent_header(atom, at):
+        return True
+    prev = None
+    for back in range(col - 1, run_start - 1, -1):
+        prev = _header_origin_at(cells, parent_row, back)
+        if prev is not None:
+            break
+    if prev is None:
+        return False
+    pt = _cell_header_text(prev, text_boxes)
+    return bool(pt) and not _are_mergeable_parent_shards(pt, at)
+
+
 def _subheader_cols_in_range(
     cells: Sequence[Dict[str, Any]],
     sub_row: int,
@@ -761,17 +925,16 @@ def _subheader_cols_in_range(
     col = cs
     while col <= max_col:
         if col > cs and parent_row is not None:
-            # 邻组父表头起始列 → 停止（如 酸催化剂|IPVE）
+            # 邻组完整父表头起始列 → 停止（如 组合物中的|(6)的、酸催化剂|IPVE）
             pc = _cell_covering_row_col(cells, parent_row, col)
             if pc is not None and int(pc["col_start"]) == col:
                 pt = _cell_header_text(pc, text_boxes)
-                if pt and not _is_header_shard(pt):
+                if pt and _is_standalone_parent_header(pc, pt):
                     break
-            atom = _atomic_cell_at_row_col(cells, parent_row, col)
-            if atom is not None:
-                at = _cell_header_text(atom, text_boxes)
-                if at and not _is_header_shard(at):
-                    break
+            if _is_new_parent_phrase_start(
+                cells, parent_row, col, cs, text_boxes
+            ):
+                break
         label = _labels_in_row_range(cells, sub_row, col, col, text_boxes)[0]
         if label and not _is_header_shard(label):
             cols.append(col)
@@ -792,30 +955,141 @@ def _subheader_cols_in_range(
     return cols
 
 
+def _header_tier_cols_in_range(
+    cells: Sequence[Dict[str, Any]],
+    parent_row: int,
+    header_end: int,
+    cs: int,
+    max_col: int,
+    text_boxes: Sequence[Dict[str, Any]],
+) -> List[int]:
+    """parent_row 下方至 header_end 的连续表头列（含 rowspan 占位列）。"""
+    cols: List[int] = []
+    col = cs
+    while col <= max_col:
+        if col > cs:
+            atom = _header_origin_at(cells, parent_row, col)
+            if atom is not None:
+                at = _cell_header_text(atom, text_boxes)
+                if at and _is_standalone_parent_header(atom, at):
+                    break
+            if _is_new_parent_phrase_start(
+                cells, parent_row, col, cs, text_boxes
+            ):
+                break
+        has_tier = False
+        for r in range(parent_row + 1, header_end + 1):
+            cell = _cell_covering_row_col(cells, r, col)
+            if cell is None:
+                continue
+            t = _cell_header_text(cell, text_boxes)
+            if not t:
+                continue
+            if int(cell["row_start"]) > parent_row or r == header_end:
+                has_tier = True
+                break
+        if has_tier:
+            cols.append(col)
+            col += 1
+            continue
+        if cols:
+            nxt = col + 1
+            if nxt <= max_col:
+                nxt_cell = _cell_covering_row_col(cells, header_end, nxt)
+                nxt_t = (
+                    _cell_header_text(nxt_cell, text_boxes) if nxt_cell else ""
+                )
+                if nxt_t and not _is_parent_header_fragment(nxt_t):
+                    cols.append(col)
+                    col += 1
+                    continue
+            break
+        col += 1
+    return cols
+
+
+def _subheader_cols_for_parent(
+    cells: Sequence[Dict[str, Any]],
+    parent_row: int,
+    sub_row: int,
+    cs: int,
+    max_col: int,
+    text_boxes: Sequence[Dict[str, Any]],
+) -> List[int]:
+    """父表头下方应对齐的子列：多级表头用整带列范围，二级表头用叶子行。"""
+    if sub_row > parent_row + 1:
+        tier = _header_tier_cols_in_range(
+            cells, parent_row, sub_row, cs, max_col, text_boxes
+        )
+        if tier:
+            return tier
+    return _subheader_cols_in_range(
+        cells, sub_row, cs, max_col, text_boxes, parent_row=parent_row
+    )
+
+
 def should_preserve_header_colspan(
     cell: Dict[str, Any],
     cells: Sequence[Dict[str, Any]],
     text_boxes: Sequence[Dict[str, Any]],
 ) -> bool:
-    """归属阶段：勿将多级父表头 colspan 按 col_seps 拆成原子列。"""
+    """归属阶段：勿将多级父表头 colspan 按 col_seps 拆成原子列。
+
+    三级表头时父头可能在 row0/1，不能只用全局 (parent,sub) 对；以本格
+    row_start 为父行，向下找叶子子列。已覆盖 ≥2 叶子列的宽格直接保留。
+    """
     if max(int(cell.get("col_span") or 1), 1) <= 1:
         return False
     row_seps, _ = _derive_seps(cells)
     if len(row_seps) < 3:
         return False
-    parent_row, sub_row = _nested_header_parent_sub_rows(cells, text_boxes, row_seps)
+    body_row = _first_body_row_index(cells, text_boxes, row_seps)
+    if body_row < 2:
+        return False
+    header_end = body_row - 1
     rs = int(cell["row_start"])
-    if not (parent_row <= rs <= sub_row):
+    if rs > header_end:
         return False
     cs, ce = int(cell["col_start"]), int(cell["col_end"])
     max_col = max(int(c["col_end"]) for c in cells)
-    sub_cols = _subheader_cols_in_range(
-        cells, sub_row, cs, max_col, text_boxes, parent_row=parent_row
+    # 以本格所在行为父行，叶子行为表头带底行
+    sub_cols = _subheader_cols_for_parent(
+        cells, rs, header_end, cs, max_col, text_boxes
     )
     if len(sub_cols) < 2:
-        return False
-    top_labels = _labels_in_row_range(cells, parent_row, cs, ce, text_boxes)
-    bottom_labels = [_labels_in_row_range(cells, sub_row, c, c, text_boxes)[0] for c in sub_cols]
+        # 兼容二级表头的全局 parent/sub 探测
+        parent_row, sub_row = _nested_header_parent_sub_rows(
+            cells, text_boxes, row_seps
+        )
+        if parent_row is None or sub_row is None:
+            return False
+        if not (parent_row <= rs <= sub_row):
+            return False
+        sub_cols = _subheader_cols_for_parent(
+            cells, parent_row, sub_row, cs, max_col, text_boxes
+        )
+        if len(sub_cols) < 2:
+            return False
+        top_labels = _labels_in_row_range(cells, parent_row, cs, ce, text_boxes)
+        bottom_labels = [
+            _labels_in_row_range(cells, sub_row, c, c, text_boxes)[0] for c in sub_cols
+        ]
+        return _should_merge_parent_shard_run(top_labels, bottom_labels)
+
+    # 本格已横跨 ≥2 叶子列 → 即父头，禁止按子列竖线拆开
+    # （否则会把「通式(5)、通式(6)的化合物」拆成「(6)的|化合物」并丢掉上行折行）
+    covered = [c for c in sub_cols if cs <= c <= ce]
+    if len(covered) >= 2:
+        bottom_labels = [
+            _labels_in_row_range(cells, header_end, c, c, text_boxes)[0]
+            for c in covered
+        ]
+        if sum(1 for t in bottom_labels if t) >= 2:
+            return True
+    top_labels = _labels_in_row_range(cells, rs, cs, ce, text_boxes)
+    bottom_labels = [
+        _labels_in_row_range(cells, header_end, c, c, text_boxes)[0] for c in sub_cols
+    ]
     return _should_merge_parent_shard_run(top_labels, bottom_labels)
 
 
@@ -862,14 +1136,162 @@ def _should_merge_parent_shard_run(
     """父表头行短碎片应合并为 colspan 父头，而非与下方子列 1:1 对齐。"""
     top_texts = [t for t in top_labels if t]
     bottom_texts = [t for t in bottom_labels if t]
-    shard_count = sum(1 for t in top_texts if _is_header_shard(t))
-    if shard_count < 2:
+    frag_count = sum(1 for t in top_labels if _is_parent_header_fragment(t))
+    if frag_count < 2:
         return False
+    # 双列「基础|聚合物 + 种类|量」保持拆分
+    if len(bottom_labels) == 2 and len(top_texts) == 2:
+        if _is_paired_dual_column_group(top_labels, bottom_labels):
+            return False
     if len(bottom_texts) >= 3 and len(top_texts) < len(bottom_texts):
         return True
-    if len(bottom_labels) == 2 and len(top_texts) == 2:
-        return not _is_paired_dual_column_group(top_labels, bottom_labels)
+    if len(bottom_texts) >= 2 and len(top_texts) >= 2:
+        return True
+    # 中层折行续头（室温放|置0日后）：子列可能被误扩 rowspan 遮住
+    if any(_PARENT_CONT_HEAD_RE.match(_compact(t) or "") for t in top_texts):
+        return True
+    if len(top_texts) >= 2 and frag_count >= 2:
+        return True
     return False
+
+
+def _merge_parent_shards_on_row(
+    work: List[Dict[str, Any]],
+    *,
+    parent_row: int,
+    sub_row: int,
+    max_col: int,
+    text_boxes: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """在 parent_row 上合并相邻父表头碎片；sub_row 为叶子表头行。"""
+    merges = 0
+    col = 0
+    while col <= max_col:
+        first = _header_origin_at(work, parent_row, col)
+        if first is None:
+            cov = _cell_covering_row_col(work, parent_row, col)
+            if cov is not None and int(cov.get("col_span") or 1) > 1:
+                col = int(cov["col_end"]) + 1
+                continue
+            col += 1
+            continue
+
+        run_cols: List[int] = [col]
+        c = col
+        while c + 1 <= max_col:
+            nxt = _header_origin_at(work, parent_row, c + 1)
+            if nxt is None:
+                break
+            cur = _header_origin_at(work, parent_row, c)
+            cur_t = _cell_header_text(cur, text_boxes) if cur else ""
+            nxt_t = _cell_header_text(nxt, text_boxes)
+            if not _are_mergeable_parent_shards(cur_t, nxt_t):
+                break
+            run_cols.append(c + 1)
+            c += 1
+
+        cs, ce = run_cols[0], run_cols[-1]
+        top_labels = _parent_labels_in_col_range(
+            work, parent_row, cs, ce, text_boxes
+        )
+        sub_cols = _subheader_cols_for_parent(
+            work, parent_row, sub_row, cs, max_col, text_boxes
+        )
+        bottom_labels = [
+            _labels_in_row_range(work, sub_row, sc, sc, text_boxes)[0] for sc in sub_cols
+        ] if sub_cols else _labels_in_row_range(work, sub_row, cs, ce, text_boxes)
+
+        if len(run_cols) >= 2 and _should_merge_parent_shard_run(
+            top_labels, bottom_labels
+        ):
+            idxs = [
+                i
+                for i, cell in enumerate(work)
+                if int(cell["row_start"]) == parent_row
+                and int(cell["col_start"]) in run_cols
+            ]
+            idxs.sort(key=lambda i: int(work[i]["col_start"]))
+            if len(idxs) >= 2:
+                cells_to_merge = [work[i] for i in idxs]
+                # 合并前保留最大纵向跨度，避免钳回后父头下方出现空 td
+                keep_rs = min(int(c["row_start"]) for c in cells_to_merge)
+                keep_re = max(int(c["row_end"]) for c in cells_to_merge)
+                merged = dict(cells_to_merge[0])
+                for mc in cells_to_merge[1:]:
+                    merged = _merge_horizontal_pair(merged, mc)
+                combined = "".join(
+                    _cell_header_text(c, text_boxes) for c in cells_to_merge
+                )
+                # 按合并后外接框回收 OCR（含被竖线拆丢的上行折行）
+                combined = _header_text_from_ocr_union(
+                    text_boxes, _cell_bbox(merged), combined
+                )
+                if combined:
+                    merged["text"] = combined
+                # 中层碎片合并：默认钳回本行；若原文已有 rowspan 且未吞到叶子行则保留
+                if parent_row < sub_row:
+                    if keep_re < sub_row and keep_re > keep_rs:
+                        merged["row_start"] = keep_rs
+                        merged["row_end"] = keep_re
+                    else:
+                        merged["row_start"] = parent_row
+                        merged["row_end"] = parent_row
+                    _refresh_spans(merged)
+                if sub_cols and sub_cols[-1] > int(merged["col_end"]):
+                    merged["col_end"] = sub_cols[-1]
+                    _refresh_spans(merged)
+                    lx1, ly1, lx2, ly2 = _cell_bbox(merged)
+                    rx = _cell_bbox(cells_to_merge[-1])[2]
+                    merged["polygon"] = _rebuild_polygon(lx1, ly1, rx, ly2)
+                    # 扩展列范围后再回收一次 OCR
+                    combined2 = _header_text_from_ocr_union(
+                        text_boxes, _cell_bbox(merged), str(merged.get("text") or "")
+                    )
+                    if combined2:
+                        merged["text"] = combined2
+                        combined = combined2
+                drop_idx = set(idxs)
+                new_work: List[Dict[str, Any]] = []
+                for i, c in enumerate(work):
+                    if i in drop_idx:
+                        if i == idxs[0]:
+                            new_work.append(merged)
+                        continue
+                    new_work.append(c)
+                work = new_work
+                merges += 1
+                logger.debug(
+                    "shard_colspan: merge row %d cols %d..%d → %r (span=%d)",
+                    parent_row,
+                    cs,
+                    ce,
+                    combined[:16],
+                    int(merged.get("col_span") or 1),
+                )
+        elif len(run_cols) == 1 and sub_cols and sub_cols[-1] > ce:
+            idx = next(
+                (
+                    i
+                    for i, cell in enumerate(work)
+                    if int(cell["row_start"]) == parent_row
+                    and int(cell["col_start"]) == cs
+                ),
+                None,
+            )
+            if idx is not None:
+                if _should_merge_parent_shard_run(top_labels, bottom_labels):
+                    cell = work[idx]
+                    if int(cell["col_end"]) < sub_cols[-1]:
+                        cell = dict(cell)
+                        cell["col_end"] = sub_cols[-1]
+                        _refresh_spans(cell)
+                        x1, y1, x2, y2 = _cell_bbox(cell)
+                        cell["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
+                        work[idx] = cell
+                        merges += 1
+
+        col = ce + 1
+    return work, merges
 
 
 def repair_parent_header_shard_colspans(
@@ -880,6 +1302,7 @@ def repair_parent_header_shard_colspans(
     父表头行：相邻短 CJK 碎片合并为 colspan 父头。
 
     典型：TSR 将「酸催化剂」拆成「酸催|化剂|空」三格，而子表头行有 种类|pKa|量 三列。
+    三级表头：逐层扫描 parent_row→叶子表头行（如 评价|结果 + 6 叶子列）。
     不合并「基础|聚合物 + 种类|量(g)」这类双列配对布局。
 
     须在 OCR 归属之后调用（或至少 cells 上已有父表头碎片文本），以便从
@@ -897,8 +1320,40 @@ def repair_parent_header_shard_colspans(
     if body_row < 2:
         return cells
 
-    parent_row, sub_row = _nested_header_parent_sub_rows(cells, text_boxes, row_seps)
     max_col = max(int(c["col_end"]) for c in cells)
+
+    # 三级及以上表头（含题注已剥离后 body_row==3）：逐父行扫描，允许 rowspan 起点格
+    if body_row >= 3:
+        header_end = body_row - 1
+        sub_row = header_end
+        parent_rows = [
+            r
+            for r in range(0, header_end)
+            if not _row_is_full_width_caption(cells, r, max_col)
+        ]
+        work = [dict(c) for c in cells]
+        total_merges = 0
+        for parent_row in parent_rows:
+            work, n = _merge_parent_shards_on_row(
+                work,
+                parent_row=parent_row,
+                sub_row=sub_row,
+                max_col=max_col,
+                text_boxes=text_boxes,
+            )
+            total_merges += n
+        if total_merges:
+            logger.info(
+                "shard_colspan: 合并 %d 组父表头碎片 (header_end=%d body_row=%d)",
+                total_merges,
+                header_end,
+                body_row,
+            )
+            work = dedupe_overlapping_cells(work)
+        return work
+
+    # 二级表头（body_row==2，如 P97/P38）：(父行, 子行) 单对 + 原子格扫描
+    parent_row, sub_row = _nested_header_parent_sub_rows(cells, text_boxes, row_seps)
 
     work = [dict(c) for c in cells]
     merges = 0
@@ -906,7 +1361,6 @@ def repair_parent_header_shard_colspans(
     while col <= max_col:
         first = _atomic_cell_at_row_col(work, parent_row, col)
         if first is None:
-            # 已被 colspan 覆盖
             cov = _cell_covering_row_col(work, parent_row, col)
             if cov is not None and int(cov.get("col_span") or 1) > 1:
                 col = int(cov["col_end"]) + 1
@@ -920,13 +1374,18 @@ def repair_parent_header_shard_colspans(
             nxt = _atomic_cell_at_row_col(work, parent_row, c + 1)
             if nxt is None:
                 break
+            cur = _atomic_cell_at_row_col(work, parent_row, c)
+            cur_t = _cell_header_text(cur, text_boxes) if cur else ""
+            nxt_t = _cell_header_text(nxt, text_boxes)
+            if not _are_mergeable_parent_shards(cur_t, nxt_t):
+                break
             run_cols.append(c + 1)
             c += 1
 
         cs, ce = run_cols[0], run_cols[-1]
         top_labels = _labels_in_row_range(work, parent_row, cs, ce, text_boxes)
-        sub_cols = _subheader_cols_in_range(
-            work, sub_row, cs, max_col, text_boxes, parent_row=parent_row
+        sub_cols = _subheader_cols_for_parent(
+            work, parent_row, sub_row, cs, max_col, text_boxes
         )
         bottom_labels = [
             _labels_in_row_range(work, sub_row, sc, sc, text_boxes)[0] for sc in sub_cols
@@ -953,7 +1412,11 @@ def repair_parent_header_shard_colspans(
                 )
                 if combined:
                     merged["text"] = combined
-                # 子表头列数 > 父碎片列数 → 扩展 colspan（如 酸催|化剂 + 种类|pKa|量）
+                # 中层碎片合并：钳回本行，避免误扩 rowspan 吞掉叶子表头
+                if parent_row < sub_row:
+                    merged["row_start"] = parent_row
+                    merged["row_end"] = parent_row
+                    _refresh_spans(merged)
                 if sub_cols and sub_cols[-1] > int(merged["col_end"]):
                     merged["col_end"] = sub_cols[-1]
                     _refresh_spans(merged)
@@ -970,15 +1433,7 @@ def repair_parent_header_shard_colspans(
                     new_work.append(c)
                 work = new_work
                 merges += 1
-                logger.debug(
-                    "shard_colspan: merge cols %d..%d → %r (span=%d)",
-                    cs,
-                    ce,
-                    combined[:16],
-                    int(merged.get("col_span") or 1),
-                )
         elif len(run_cols) == 1 and sub_cols and sub_cols[-1] > ce:
-            # 单格父头已存在但 colspan 不足（assign 前 TSR 宽格未被拆的情况兜底）
             idx = next(
                 (
                     i
@@ -989,8 +1444,7 @@ def repair_parent_header_shard_colspans(
                 None,
             )
             if idx is not None:
-                top_labels_single = top_labels
-                if _should_merge_parent_shard_run(top_labels_single, bottom_labels):
+                if _should_merge_parent_shard_run(top_labels, bottom_labels):
                     cell = work[idx]
                     if int(cell["col_end"]) < sub_cols[-1]:
                         cell = dict(cell)

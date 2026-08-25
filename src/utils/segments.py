@@ -16,7 +16,10 @@ import numpy as np
 _Y_GAP_THRESH_PX = 48.0
 # 通用表题：表 / Table / Tab. / 図 / Fig + 编号
 _HEADER_CAPTION_RE = re.compile(
-    r"(?:\[?\s*(?:表|図)\s*[\d\-ー－]+|\b(?:Table|Tab\.?|Fig\.?|Figure)\s*[\d\-]+)",
+    r"(?:"
+    r"[\[［【]?\s*(?:表|図)\s*[\d\-ー－]+\s*[\]］】]?"
+    r"|\b(?:Table|Tab\.?|Fig\.?|Figure)\s*[\d\-]+"
+    r")",
     re.IGNORECASE,
 )
 # 重复表头 Jaccard 阈值
