@@ -98,6 +98,38 @@ def estimate_axis_rotation(image: np.ndarray) -> int:
     return 0
 
 
+def _mean_ocr_score(text_boxes: list) -> float:
+    if not text_boxes:
+        return 0.0
+    scores = [float(tb.get("score") or 0.0) for tb in text_boxes]
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def _box_aspect_upright_ratio(text_boxes: list) -> float:
+    """按文本长度加权的横长框占比（长文本框权重更高，天然压制单字符干扰）。"""
+    if not text_boxes:
+        return 0.0
+
+    total_weight = 0.0
+    upright_weight = 0.0
+
+    for tb in text_boxes:
+        poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if poly.size < 4:
+            continue
+        w = float(poly[:, 0].max() - poly[:, 0].min())
+        h = float(poly[:, 1].max() - poly[:, 1].min())
+
+        text_len = len(str(tb.get("text") or "").strip())
+        weight = max(1.0, min(float(text_len), 10.0))
+
+        total_weight += weight
+        if w >= h * 0.85:
+            upright_weight += weight
+
+    return (upright_weight / total_weight) if total_weight > 0 else 0.0
+
+
 def _orientation_quality(text_boxes: list) -> float:
     """综合分：置信度 + 横长框占比。"""
     if not text_boxes:
@@ -105,21 +137,74 @@ def _orientation_quality(text_boxes: list) -> float:
     return _mean_ocr_score(text_boxes) + 0.25 * _box_aspect_upright_ratio(text_boxes)
 
 
+def _grid_line_strengths(image: np.ndarray) -> Tuple[float, float]:
+    """返回 (hline_score, vline_score)，大致为线墨迹占比。"""
+    if image is None or getattr(image, "size", 0) == 0:
+        return 0.0, 0.0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape[:2]
+    if h < 32 or w < 32:
+        return 0.0, 0.0
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 25, 15), 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(h // 25, 15)))
+    hmask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, hk)
+    vmask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vk)
+    area = float(h * w)
+    return float(np.count_nonzero(hmask)) / area, float(np.count_nonzero(vmask)) / area
+
+
+def has_strong_upright_wired_grid(image: np.ndarray) -> bool:
+    """
+    有线网格整体直立：横竖线都明显，且图像偏「竖表」（高不显著小于宽）。
+
+    用于否决「仅因竖排表头字」导致的整图 90° 误转。
+    """
+    if image is None or getattr(image, "size", 0) == 0:
+        return False
+    h, w = image.shape[:2]
+    # 明显横躺的整页（宽 >> 高）不否决 try90
+    if w > h * 1.25:
+        return False
+    hs, vs = _grid_line_strengths(image)
+    if hs < 0.004 or vs < 0.003:
+        return False
+    return hs >= vs * 0.55
+
+
+def looks_sideways_wired_grid(image: np.ndarray) -> bool:
+    """
+    有线表被整页侧躺成竖图：高明显大于宽，且竖线墨迹显著强于横线。
+
+    原表横线旋转后变成竖线 → vs≫hs。与「直立表 + 竖排表头字」相反：
+    后者 hs 仍不弱于 vs。用于 OCR 单字框 aspect 看不出侧躺时仍触发 try90。
+    """
+    if image is None or getattr(image, "size", 0) == 0:
+        return False
+    h, w = image.shape[:2]
+    if h < w * 1.15:
+        return False
+    hs, vs = _grid_line_strengths(image)
+    if vs < 0.008:
+        return False
+    return vs > hs * 1.35
+
+
 def looks_sideways(text_boxes: list, *, score_thresh: float = 0.55) -> bool:
-    """OCR 结果是否像侧躺（竖长框多或置信度差）。"""
+    """OCR 结果是否像侧躺（基于加权横长框占比与置信度）。"""
     if len(text_boxes) < 5:
         return True
+
     aspect = _box_aspect_upright_ratio(text_boxes)
     score = _mean_ocr_score(text_boxes)
-    
-    # 【核心修复】放宽侧躺检测的触发阈值。
-    # 原本的 0.40 太严苛，导致全是短字符（数字/单字母）的侧躺表被漏判。
-    # 提高到 0.75 后，短字符侧躺表会进入 try90 测试，由 q90 > q0 做最终正确裁决。
-    if aspect < 0.75:
+
+    # 正常排版表格 aspect 通常 ≥0.70；真正侧躺常暴跌至 0.30 以下
+    if aspect < 0.50:
         return True
-    if aspect < 0.85 and score < score_thresh:
+    if aspect < 0.65 and score < score_thresh:
         return True
     return False
+
 
 def ensure_upright_axis(
     image: np.ndarray,
@@ -133,11 +218,21 @@ def ensure_upright_axis(
 ) -> Tuple[np.ndarray, int, list]:
     """
     若当前 OCR 结果像侧躺，则试转 90° 并取质更好者。
+
+    有线竖表（网格直立、仅表头竖排字）跳过 try90，避免整图旋转打乱网格。
+    有线表整页侧躺（竖线主导的窄高图）即使 OCR aspect 正常也试转 90°。
     """
     from ..core.models import predict_texts
 
-    # 恢复为纯 OCR 框特征门控，彻底抛弃会误杀无横线表格的 estimate_axis_rotation
-    if not looks_sideways(text_boxes, score_thresh=score_thresh):
+    ocr_sideways = looks_sideways(text_boxes, score_thresh=score_thresh)
+    grid_sideways = looks_sideways_wired_grid(image)
+    if not ocr_sideways and not grid_sideways:
+        return image, 0, text_boxes
+
+    if has_strong_upright_wired_grid(image) and not grid_sideways:
+        logger.info(
+            "方向轴向: 检测到直立有线网格，跳过 try90（避免竖排表头误转整图）"
+        )
         return image, 0, text_boxes
 
     rotated = rotate_image(image, 90)
@@ -150,62 +245,36 @@ def ensure_upright_axis(
     )
     q0 = _orientation_quality(text_boxes)
     q90 = _orientation_quality(boxes90)
+
+    # 网格已判定侧躺：旋转后若横线恢复主导，优先采纳 90°
+    if grid_sideways:
+        hs90, vs90 = _grid_line_strengths(rotated)
+        if hs90 >= vs90 * 0.55 and (q90 >= q0 - 0.05 or q90 > 0.35):
+            logger.info(
+                "方向轴向: 侧躺有线网格，采纳 90° (q0=%.3f q90=%.3f hs90=%.4f vs90=%.4f)",
+                q0,
+                q90,
+                hs90,
+                vs90,
+            )
+            return rotated, 90, boxes90
+
+    hs0, vs0 = _grid_line_strengths(image)
+    hs90, vs90 = _grid_line_strengths(rotated)
+    if hs0 > 0.004 and vs0 > 0.003 and hs0 >= vs0 * 0.5:
+        if vs90 >= hs90 * 0.9 and q90 < q0 + 0.08:
+            logger.info(
+                "方向轴向 OCR 比对: q0=%.3f q90=%.3f（网格惩罚，保持 0°）",
+                q0,
+                q90,
+            )
+            return image, 0, text_boxes
+
     logger.info("方向轴向 OCR 比对: q0=%.3f q90=%.3f", q0, q90)
-    
+
     if q90 > q0:
         return rotated, 90, boxes90
     return image, 0, text_boxes
-
-
-def _mean_ocr_score(text_boxes: list) -> float:
-    if not text_boxes:
-        return 0.0
-    scores = [float(tb.get("score") or 0.0) for tb in text_boxes]
-    return float(np.mean(scores)) if scores else 0.0
-
-
-def _box_aspect_upright_ratio(text_boxes: list) -> float:
-    """按文本长度加权的横长框占比（长文本框权重更高，天然压制单字符干扰）。"""
-    if not text_boxes:
-        return 0.0
-    
-    total_weight = 0.0
-    upright_weight = 0.0
-    
-    for tb in text_boxes:
-        poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
-        if poly.size < 4:
-            continue
-        w = float(poly[:, 0].max() - poly[:, 0].min())
-        h = float(poly[:, 1].max() - poly[:, 1].min())
-        
-        # 权重取文本字符数（最小为 1，上限截断到 10 避免个别极长文本独占权重）
-        text_len = len(str(tb.get("text") or "").strip())
-        weight = max(1.0, min(float(text_len), 10.0))
-        
-        total_weight += weight
-        # 略放宽单框阈值：宽达到高的 0.85 即算横向
-        if w >= h * 0.85:
-            upright_weight += weight
-            
-    return (upright_weight / total_weight) if total_weight > 0 else 0.0
-
-
-def looks_sideways(text_boxes: list, *, score_thresh: float = 0.55) -> bool:
-    """OCR 结果是否像侧躺（基于加权横长框占比与置信度）。"""
-    if len(text_boxes) < 5:
-        return True
-    
-    aspect = _box_aspect_upright_ratio(text_boxes)
-    score = _mean_ocr_score(text_boxes)
-    
-    # 经过字符长度加权后，正常排版表格的 aspect 通常在 0.70 以上
-    # 真正侧躺的表格 aspect 通常会暴跌至 0.30 以下
-    if aspect < 0.50:
-        return True
-    if aspect < 0.65 and score < score_thresh:
-        return True
-    return False
 
 
 def parse_orientation_mode(mode: Union[str, int]) -> Union[str, int]:
@@ -270,7 +339,6 @@ def maybe_flip_180_by_ocr(
         return image, 0, text_boxes
 
     flipped = rotate_image(image, 180)
-    # 翻转后角度 = 原缓存角 + 180；这里用独立 key
     boxes1 = predict_texts(
         flipped,
         ocr_engine=ocr_engine,

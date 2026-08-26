@@ -2640,135 +2640,14 @@ def _fix_dash_column_consistency(
 
 
 # ---------------------------------------------------------------------------
-# 空单元格符号检测：○ / ◎ / △ / × 等评价符号
+# 列代号表头空格推断（J/K/L…）；评价符号一律以 OCR 原文为准，不做 CV 补全/改写
 # ---------------------------------------------------------------------------
-
-def _is_cross_mark(fg: np.ndarray, h_roi: int, w_roi: int) -> bool:
-    """检测 ×：两条近似正交的斜线，排除水平/竖直（横线误识）。"""
-    side = max(min(h_roi, w_roi), 1)
-    min_len = max(8, int(round(side * 0.22)))
-    thresh = max(12, int(round(side * 0.28)))
-    lines = cv2.HoughLinesP(
-        fg,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=thresh,
-        minLineLength=min_len,
-        maxLineGap=max(2, int(round(side * 0.08))),
-    )
-    if lines is None or len(lines) < 2:
-        return False
-    diagonals: List[float] = []
-    for ln in lines[:12]:
-        x1, y1, x2, y2 = (int(v) for v in ln[0])
-        length = float(np.hypot(x2 - x1, y2 - y1))
-        if length < min_len:
-            continue
-        ang = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-        # 跳过近水平/近竖直线段（破折号或格线残留）
-        acute = abs(ang) % 90.0
-        if acute < 12.0 or acute > 78.0:
-            continue
-        diagonals.append(ang)
-    if len(diagonals) < 2:
-        return False
-    for i in range(len(diagonals)):
-        for j in range(i + 1, len(diagonals)):
-            diff = abs(diagonals[i] - diagonals[j])
-            diff = min(diff, 360.0 - diff)
-            if 65.0 <= diff <= 115.0:
-                return True
-    return False
-
-
-def _detect_eval_symbol(roi: np.ndarray) -> Optional[str]:
-    """对单元格 ROI（二值图，前景=255）做轮廓分析，识别评价符号。"""
-    if roi is None or roi.size == 0:
-        return None
-    fg = (roi > 0).astype(np.uint8) * 255
-    fg_ratio = np.count_nonzero(fg) / max(fg.size, 1)
-    if fg_ratio < 0.01:
-        return None
-
-    contours, _ = cv2.findContours(fg, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    h_roi, w_roi = roi.shape[:2]
-    min_area = max(20, int(h_roi * w_roi * 0.02))
-
-    significant = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area >= min_area:
-            significant.append(cnt)
-    if not significant:
-        return None
-
-    def _is_circular(cnt: np.ndarray) -> bool:
-        area = cv2.contourArea(cnt)
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter < 1e-3:
-            return False
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-        return circularity > 0.65
-
-    def _is_triangular(cnt: np.ndarray) -> bool:
-        perimeter = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.04 * perimeter, True)
-        if len(approx) != 3:
-            return False
-        area = cv2.contourArea(cnt)
-        if area < min_area:
-            return False
-        return True
-
-    circular = [c for c in significant if _is_circular(c)]
-    triangular = [c for c in significant if _is_triangular(c)]
-
-    if len(circular) >= 2:
-        areas = sorted([cv2.contourArea(c) for c in circular], reverse=True)
-        if areas[1] / max(areas[0], 1e-6) > 0.15:
-            return "◎"
-    if len(circular) == 1:
-        return "○"
-    if triangular:
-        return "△"
-
-    if _is_cross_mark(fg, h_roi, w_roi):
-        return "×"
-
-    return None
-
-
-def _cell_texts_on_row(cells: List[Dict[str, Any]], row: int) -> List[str]:
-    out: List[str] = []
-    for c in cells:
-        rs = int(c.get("row_start") or 0)
-        re_ = int(c.get("row_end") or 0)
-        if rs <= row <= re_:
-            t = re.sub(r"\s+", "", str(c.get("text") or "").strip())
-            if t:
-                out.append(t)
-    return out
-
-
-def _cell_texts_on_col(cells: List[Dict[str, Any]], col: int) -> List[str]:
-    out: List[str] = []
-    for c in cells:
-        if int(c.get("col_start") or -1) != col:
-            continue
-        t = re.sub(r"\s+", "", str(c.get("text") or "").strip())
-        if t:
-            out.append(t)
-    return out
-
 
 _SINGLE_SAMPLE_LETTER_RE = re.compile(r"^[A-Z]$")
 
 
 def _row_is_sample_letter_header(cells: List[Dict[str, Any]], row: int) -> bool:
-    """列头行：J/K/L/M/N/O/P… 等连续大写字母，空位可能是 OCR 漏检而非评价符号。"""
+    """列头行：J/K/L/M/N/O/P… 等连续大写字母，空位可能是 OCR 漏检。"""
     letter_cols: List[int] = []
     for c in cells:
         rs = int(c.get("row_start") or 0)
@@ -2827,63 +2706,26 @@ def _infer_missing_sample_letter(
     return missing if missing.isalpha() and missing.isupper() else None
 
 
-def _skip_eval_symbol_fill(cells: List[Dict[str, Any]], cell: Dict[str, Any]) -> bool:
-    """数值/分辨率行或「无法评价」+数字混排列上不填 ○/◎/△。
-
-    表头左上角斜线框（P97）易被误检为 ×，跳过。
-    """
-    row = int(cell.get("row_start") or 0)
-    col = int(cell.get("col_start") or 0)
-    if row <= 1 and col <= 1:
-        return True
-    row_texts = _cell_texts_on_row(cells, row)
-    if any("无法评价" in t for t in row_texts):
-        return True
-    if sum(1 for t in row_texts if _NUM_ONLY_RE.fullmatch(t)) >= 2:
-        return True
-    col_texts = _cell_texts_on_col(cells, col)
-    has_wufa = any("无法评价" in t for t in col_texts)
-    has_num = any(_NUM_ONLY_RE.fullmatch(t) for t in col_texts)
-    return has_wufa and has_num
-
-
-def detect_eval_symbols_in_empty_cells(
+def infer_missing_sample_letters_in_empty_cells(
     cells: List[Dict[str, Any]],
-    binary: Optional[np.ndarray],
 ) -> List[Dict[str, Any]]:
-    """对空单元格做 CV 符号检测，填充 ○/◎/△ 等评价符号。"""
-    if binary is None or binary.size == 0:
-        return cells
-    h_img, w_img = binary.shape[:2]
+    """列代号表头行上，OCR 漏检的空格用左右邻字母推断。"""
     for cell in cells:
         txt = (cell.get("text") or "").strip()
         if txt:
             continue
         row = int(cell.get("row_start") or 0)
-        if _row_is_sample_letter_header(cells, row):
-            inferred = _infer_missing_sample_letter(cells, cell, row)
-            if inferred:
-                cell["text"] = inferred
-                logger.debug(
-                    "列代号推断: cell (%d,%d) → %s", row, cell.get("col_start", -1), inferred
-                )
+        if not _row_is_sample_letter_header(cells, row):
             continue
-        if _skip_eval_symbol_fill(cells, cell):
-            continue
-        poly = np.asarray(cell.get("polygon"), dtype=np.float64).reshape(-1, 2)
-        if poly.size < 4:
-            continue
-        x1 = int(max(0, np.floor(poly[:, 0].min())))
-        y1 = int(max(0, np.floor(poly[:, 1].min())))
-        x2 = int(min(w_img, np.ceil(poly[:, 0].max())))
-        y2 = int(min(h_img, np.ceil(poly[:, 1].max())))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        roi = binary[y1:y2, x1:x2]
-        sym = _detect_eval_symbol(roi)
-        if sym:
-            cell["text"] = sym
-            logger.debug("符号检测: cell (%d,%d) → %s", cell.get("row_start", -1), cell.get("col_start", -1), sym)
+        inferred = _infer_missing_sample_letter(cells, cell, row)
+        if inferred:
+            cell["text"] = inferred
+            logger.debug(
+                "列代号推断: cell (%d,%d) → %s",
+                row,
+                cell.get("col_start", -1),
+                inferred,
+            )
     return cells
 
 
@@ -2909,7 +2751,7 @@ def detect_dashes_in_empty_cells(
             continue
         if int(cell.get("row_span", 1) or 1) != 1:
             continue
-        # 跳过表头角与明显表头行（与评价符号同策略）
+        # 跳过表头角与明显表头行
         row = int(cell.get("row_start") or 0)
         col = int(cell.get("col_start") or 0)
         if row <= 1 and col <= 1:
@@ -2931,62 +2773,4 @@ def detect_dashes_in_empty_cells(
                 cell.get("row_start", -1),
                 cell.get("col_start", -1),
             )
-    return cells
-
-
-_EVAL_SYMBOL_CHARS = {"O", "o", "○", "×", "◎", "△"}
-
-
-def _is_eval_column(cells: List[Dict[str, Any]], col: int) -> bool:
-    """判断某列是否为评价列（多数单元格为单字符符号 O/×/○/◎/△/- 或空）。"""
-    col_texts = []
-    for c in cells:
-        if c.get("col_start") != col or c.get("col_span", 1) != 1:
-            continue
-        txt = (c.get("text") or "").strip()
-        if txt:
-            col_texts.append(txt)
-    if len(col_texts) < 2:
-        return False
-    eval_count = sum(1 for t in col_texts if t in _EVAL_SYMBOL_CHARS or t == "-")
-    return eval_count / len(col_texts) >= 0.5
-
-
-def upgrade_o_to_double_circle(
-    cells: List[Dict[str, Any]],
-    binary: Optional[np.ndarray],
-) -> List[Dict[str, Any]]:
-    """将评价列中被 OCR 识别为 'O' 但实际是 ◎（双圆圈）的单元格升级。"""
-    if binary is None or binary.size == 0:
-        return cells
-    h_img, w_img = binary.shape[:2]
-    eval_cols: Dict[int, bool] = {}
-    for cell in cells:
-        txt = (cell.get("text") or "").strip()
-        if txt not in ("O", "o", "○"):
-            continue
-        col = cell.get("col_start")
-        if col is None:
-            continue
-        row = int(cell.get("row_start") or 0)
-        if _row_is_sample_letter_header(cells, row):
-            continue
-        if col not in eval_cols:
-            eval_cols[col] = _is_eval_column(cells, col)
-        if not eval_cols[col]:
-            continue
-        poly = np.asarray(cell.get("polygon"), dtype=np.float64).reshape(-1, 2)
-        if poly.size < 4:
-            continue
-        x1 = int(max(0, np.floor(poly[:, 0].min())))
-        y1 = int(max(0, np.floor(poly[:, 1].min())))
-        x2 = int(min(w_img, np.ceil(poly[:, 0].max())))
-        y2 = int(min(h_img, np.ceil(poly[:, 1].max())))
-        if x2 <= x1 or y2 <= y1:
-            continue
-        roi = binary[y1:y2, x1:x2]
-        sym = _detect_eval_symbol(roi)
-        if sym == "◎":
-            cell["text"] = "◎"
-            logger.debug("O→◎ 升级: cell (%d,%d)", cell.get("row_start", -1), cell.get("col_start", -1))
     return cells

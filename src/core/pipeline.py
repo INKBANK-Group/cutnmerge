@@ -23,9 +23,8 @@ from ..matching.matching import (
     filter_absorbed_free_texts,
     _fix_dash_column_consistency,
     detect_dashes_in_empty_cells,
-    detect_eval_symbols_in_empty_cells,
+    infer_missing_sample_letters_in_empty_cells,
     realign_pair_left_numeric_cells,
-    upgrade_o_to_double_circle,
 )
 from ..ocr.ocr_post import postprocess_text_boxes
 from ..ocr.reocr import apply_reocr_to_cells, recover_empty_vertical_headers
@@ -65,11 +64,14 @@ from ..structure.tsr_refine import (
     logic_conflict_ratio,
     looks_overmerged_body_rowspans,
     looks_oversegmented,
+    looks_row_undersegmented,
     looks_shallow_body_rowspans,
     looks_undermerged_body_rowspans,
     max_body_rowspan,
+    merge_body_empty_columns,
     merge_ghost_columns,
     merge_ghost_rows,
+    merge_complementary_ditto_columns,
     merge_stacked_chem_amount_cells,
     normalize_oversegmented_table_rows,
     reconstruct_header_cells,
@@ -88,6 +90,7 @@ from ..structure.tsr_refine import (
     sanitize_side_header_texts,
     split_left_anchor_subheader_leak,
     split_undersplit_monomer_child_headers,
+    split_underspanned_rows,
     needs_monomer_header_reconstruct,
     structure_quality_score,
     _expand_monomer_over_child_headers,
@@ -348,8 +351,7 @@ def _extract_via_lines(
         )
         cells = _fix_dash_column_consistency(cells, binary=binary)
         cells = detect_dashes_in_empty_cells(cells, binary)
-        cells = detect_eval_symbols_in_empty_cells(cells, binary)
-        cells = upgrade_o_to_double_circle(cells, binary)
+        cells = infer_missing_sample_letters_in_empty_cells(cells)
         cells = recover_empty_vertical_headers(
             image,
             cells,
@@ -443,8 +445,7 @@ def _extract_via_lore(
     )
     cells = _fix_dash_column_consistency(cells, binary=lore_binary)
     cells = detect_dashes_in_empty_cells(cells, lore_binary)
-    cells = detect_eval_symbols_in_empty_cells(cells, lore_binary)
-    cells = upgrade_o_to_double_circle(cells, lore_binary)
+    cells = infer_missing_sample_letters_in_empty_cells(cells)
     cells = recover_empty_vertical_headers(
         image,
         cells,
@@ -506,8 +507,17 @@ def _extract_via_tsr(
         else:
             light_cells = refine_tsr_cells_light(cells)
             light_cells = merge_ghost_columns(light_cells, text_boxes)
+            light_cells = merge_body_empty_columns(light_cells, text_boxes)
+            light_cells = merge_complementary_ditto_columns(light_cells, text_boxes)
             light_cells = merge_ghost_rows(light_cells, text_boxes)
             light_cells = dedupe_overlapping_cells(light_cells)
+            # 行欠切：窄高表 light 也需 OCR-y 切分（不依赖 aggressive）
+            if looks_row_undersegmented(light_cells, text_boxes):
+                logger.info("TSR-light 检测到行欠切，尝试 split_underspanned_rows")
+                light_cells = split_underspanned_rows(
+                    light_cells, text_boxes, min_support_cols=2
+                )
+                light_cells = dedupe_overlapping_cells(light_cells)
             light_cells = repair_monomer_parent_spans(light_cells, text_boxes)
             conflict_ratio = logic_conflict_ratio(light_cells)
             keep_light_headers = _light_has_monomer_subheaders(light_cells)
@@ -567,7 +577,9 @@ def _extract_via_tsr(
         and not undermerge
         and looks_shallow_body_rowspans(cells)
     )
-    topo_bad = overseg or undermerge or shallow
+    # 窄高表行欠切（与列数无关）
+    row_under = bool(cells) and looks_row_undersegmented(cells, text_boxes)
+    topo_bad = overseg or undermerge or shallow or row_under
     need_lines_fallback = bool(
         (not cells or cov < 0.55 or too_few_cells) and fallback_lines
     ) or topo_bad
@@ -598,6 +610,15 @@ def _extract_via_tsr(
                 n_cols,
                 n_rows,
                 max_body_rowspan(cells),
+                cov,
+            )
+        elif row_under:
+            logger.info(
+                "TSR 行欠切(cols=%d rows=%d cells=%d boxes=%d cov=%.3f)，尝试框线回退",
+                n_cols,
+                n_rows,
+                n_cells,
+                len(text_boxes),
                 cov,
             )
         else:
@@ -668,6 +689,23 @@ def _extract_via_tsr(
                     and 6 <= lc <= 22
                     and line_rs >= max(5, tsr_rs + 2)
                     and score_lines >= score_tsr - 0.12
+                )
+            if row_under and not overseg and not undermerge:
+                # 行欠切：框线若恢复大量行且自身不再欠切，即使质量分略低也采纳
+                # （巨格假高覆盖会使 TSR 的 structure_quality_score 虚高）
+                line_under = looks_row_undersegmented(line_cells, text_boxes)
+                line_overmerge = looks_overmerged_body_rowspans(line_cells)
+                score_lines = structure_quality_score(line_cells, text_boxes)
+                score_tsr = structure_quality_score(cells, text_boxes)
+                rows_recovered = lr >= max(16, n_rows * 4) and lc >= 2
+                accept = (
+                    rows_recovered
+                    and not line_under
+                    and not line_overmerge
+                    and (
+                        score_lines >= score_tsr - 0.28
+                        or lr >= max(24, n_rows * 8)
+                    )
                 )
             if accept:
                 logger.info(
@@ -807,8 +845,7 @@ def _extract_via_tsr(
     cells = _fix_dash_column_consistency(cells, binary=binary)
     cells = detect_dashes_in_empty_cells(cells, binary)
     cells = realign_pair_left_numeric_cells(cells)
-    cells = detect_eval_symbols_in_empty_cells(cells, binary)
-    cells = upgrade_o_to_double_circle(cells, binary)
+    cells = infer_missing_sample_letters_in_empty_cells(cells)
     cells = peel_row_header_text(cells, text_boxes)
     cells = extend_section_rowspan_over_metric_rows(cells)
     cells = repair_component_section_rowspans(cells)

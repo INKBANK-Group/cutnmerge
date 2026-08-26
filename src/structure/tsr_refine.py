@@ -519,6 +519,365 @@ def merge_ghost_columns(
     return out
 
 
+def merge_body_empty_columns(
+    cells: List[Dict[str, Any]],
+    boxes: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    表体几乎无 OCR 落入的列 → 并入邻列（不论物理宽度）。
+
+    表头带内的标签不算表体证据；避免宽字距过切出的空列残留。
+    """
+    if not cells or not boxes:
+        return cells
+    row_seps, col_seps = _derive_seps(cells)
+    if len(col_seps) < 3 or len(row_seps) < 3:
+        return cells
+
+    n_cols = len(col_seps) - 1
+    n_rows = len(row_seps) - 1
+    # 粗估表头：顶部最多 3 行，或含长标签的连续行
+    header_rows = min(3, max(1, n_rows // 5))
+    body_y0 = float(row_seps[header_rows])
+
+    body_hits = [0] * n_cols
+    all_texts: List[List[str]] = [[] for _ in range(n_cols)]
+    for tb in boxes:
+        x1, y1, x2, y2 = _tb_bbox(tb)
+        mx = (x1 + x2) / 2.0
+        my = (y1 + y2) / 2.0
+        t = str(tb.get("text") or "").strip()
+        for c in range(n_cols):
+            if col_seps[c] <= mx < col_seps[c + 1] or (
+                c == n_cols - 1 and col_seps[c] <= mx <= col_seps[c + 1]
+            ):
+                if t:
+                    all_texts[c].append(t)
+                if my >= body_y0 and t:
+                    # 表体任意非空 OCR 均算证据（含短数字）；勿用碎片过滤，否则 1/2 等会被漏计
+                    body_hits[c] += 1
+                break
+
+    ghost = []
+    for c in range(n_cols):
+        if is_index_column(all_texts[c]):
+            ghost.append(False)
+            continue
+        # 表体无实质文本
+        ghost.append(body_hits[c] == 0)
+
+    # 禁止删光：至少保留 2 列
+    if sum(1 for g in ghost if not g) < 2:
+        return cells
+    if not any(ghost):
+        return cells
+
+    # 复用 merge_ghost_columns 的重映射逻辑：构造窄宽比无关的幽灵标记后走同一套压缩
+    # 为避免复制大段代码，临时把幽灵列宽度标成极窄再调 merge_ghost_columns 不合适；
+    # 这里直接内联压缩。
+    remap = list(range(n_cols))
+    for c in range(n_cols):
+        if not ghost[c]:
+            continue
+        target = None
+        for t in range(c + 1, n_cols):
+            if not ghost[t]:
+                target = t
+                break
+        if target is None:
+            for t in range(c - 1, -1, -1):
+                if not ghost[t]:
+                    target = t
+                    break
+        if target is not None:
+            remap[c] = target
+
+    survivors = [c for c in range(n_cols) if not ghost[c]]
+    if not survivors:
+        return cells
+    old_to_new = {old: new for new, old in enumerate(survivors)}
+
+    def resolve_old(c: int) -> int:
+        r = remap[c]
+        guard = 0
+        while ghost[r] and remap[r] != r and guard < n_cols + 2:
+            r = remap[r]
+            guard += 1
+        return r
+
+    surv_left: Dict[int, float] = {}
+    surv_right: Dict[int, float] = {}
+    for s in survivors:
+        covered = [s] + [g for g in range(n_cols) if ghost[g] and resolve_old(g) == s]
+        surv_left[s] = float(col_seps[min(covered)])
+        surv_right[s] = float(col_seps[max(covered) + 1])
+
+    out: List[Dict[str, Any]] = []
+    for cell in cells:
+        nc = dict(cell)
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        own_survivors = [i for i in range(cs, ce + 1) if not ghost[i]]
+        if own_survivors:
+            new_cs = min(old_to_new[i] for i in own_survivors)
+            new_ce = max(old_to_new[i] for i in own_survivors)
+        else:
+            mapped = [old_to_new[resolve_old(i)] for i in range(cs, ce + 1)]
+            new_cs, new_ce = min(mapped), max(mapped)
+        nc["col_start"] = new_cs
+        nc["col_end"] = new_ce
+        _refresh_spans(nc)
+        left_old = survivors[new_cs]
+        right_old = survivors[new_ce]
+        _x1, y1, _x2, y2 = _cell_bbox(cell)
+        nc["polygon"] = _rebuild_polygon(
+            surv_left[left_old], y1, surv_right[right_old], y2
+        )
+        out.append(nc)
+
+    logger.info(
+        "TSR 表体空列合并: %d -> %d cols (empty_body=%s)",
+        n_cols,
+        len(survivors),
+        [i for i, g in enumerate(ghost) if g],
+    )
+    return out
+
+
+_DITTO_MARK_RE = re.compile(
+    r"^[↑⬆⇑〃々\-–—−～~‾]+$|^[1１]$|^同上$"
+)
+
+
+def _is_ditto_or_empty(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return True
+    return bool(_DITTO_MARK_RE.match(t))
+
+
+def _is_substantive_body_text(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t or _is_ditto_or_empty(t):
+        return False
+    # 化学式 / 长标签 / 多字符
+    if len(t) >= 2:
+        return True
+    return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", t))
+
+
+def _mostly_numeric_values(texts: Sequence[str], *, min_hits: int = 4) -> bool:
+    """分子量等数值列：多数为 3~6 位纯数字。"""
+    hits = 0
+    for t in texts:
+        s = str(t or "").strip()
+        if re.fullmatch(r"\d{3,7}", s):
+            hits += 1
+    return hits >= min_hits
+
+
+_ROW_LABEL_COL_RE = re.compile(
+    r"^[（(]?[A-Za-zΑ-Ωα-ω]{1,3}[)）]?-?\d+|^实[施試]例|^比[较較]例|^参考例"
+)
+
+
+def _mostly_row_labels(texts: Sequence[str], *, min_hits: int = 4) -> bool:
+    hits = 0
+    for t in texts:
+        s = str(t or "").strip()
+        if _ROW_LABEL_COL_RE.match(s):
+            hits += 1
+    return hits >= min_hits
+
+
+def merge_complementary_ditto_columns(
+    cells: List[Dict[str, Any]],
+    boxes: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    合并被 ↑/1 等同格符「假竖线」切开的互补列。
+
+    判据（与词表无关的结构信号）：
+    - 相邻两列在表体同行几乎不同时出现实质文本；
+    - 至少一列的非空格以同格符为主；
+    - 不与数值列（分子量）合并。
+    """
+    if not cells or not boxes:
+        return cells
+    row_seps, col_seps = _derive_seps(cells)
+    if len(col_seps) < 4 or len(row_seps) < 4:
+        return cells
+
+    n_cols = len(col_seps) - 1
+    n_rows = len(row_seps) - 1
+    header_rows = min(3, max(1, n_rows // 5))
+    body_start = header_rows
+
+    # 每列每行：取落入该格的 OCR 文本（中心）
+    grid: List[List[str]] = [["" for _ in range(n_cols)] for _ in range(n_rows)]
+    for tb in boxes:
+        x1, y1, x2, y2 = _tb_bbox(tb)
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        t = str(tb.get("text") or "").strip()
+        if not t:
+            continue
+        ci = ri = None
+        for c in range(n_cols):
+            if col_seps[c] <= mx < col_seps[c + 1] or (
+                c == n_cols - 1 and col_seps[c] <= mx <= col_seps[c + 1]
+            ):
+                ci = c
+                break
+        for r in range(n_rows):
+            if row_seps[r] <= my < row_seps[r + 1] or (
+                r == n_rows - 1 and row_seps[r] <= my <= row_seps[r + 1]
+            ):
+                ri = r
+                break
+        if ci is None or ri is None:
+            continue
+        if not grid[ri][ci]:
+            grid[ri][ci] = t
+        else:
+            grid[ri][ci] = grid[ri][ci] + " " + t
+
+    merge_right_into: Dict[int, int] = {}  # ghost_col -> keep_col
+    c = 0
+    while c + 1 < n_cols:
+        if c in merge_right_into or (c + 1) in merge_right_into:
+            c += 1
+            continue
+        left_texts = [grid[r][c] for r in range(body_start, n_rows)]
+        right_texts = [grid[r][c + 1] for r in range(body_start, n_rows)]
+        if is_index_column(left_texts) or is_index_column(right_texts):
+            c += 1
+            continue
+        # 数值列（Mw）/ 行标签列永不与邻列合并
+        if (
+            _mostly_numeric_values(left_texts)
+            or _mostly_numeric_values(right_texts)
+            or _mostly_row_labels(left_texts)
+            or _mostly_row_labels(right_texts)
+        ):
+            c += 1
+            continue
+
+        both_sub = 0
+        either_sub = 0
+        left_ditto = 0
+        right_ditto = 0
+        left_sub = 0
+        right_sub = 0
+        for lt, rt in zip(left_texts, right_texts):
+            ls, rs = _is_substantive_body_text(lt), _is_substantive_body_text(rt)
+            if ls:
+                left_sub += 1
+            if rs:
+                right_sub += 1
+            if ls and rs:
+                both_sub += 1
+            if ls or rs:
+                either_sub += 1
+            if lt.strip() and _is_ditto_or_empty(lt):
+                left_ditto += 1
+            if rt.strip() and _is_ditto_or_empty(rt):
+                right_ditto += 1
+
+        if either_sub < 4:
+            c += 1
+            continue
+        # 同行双实质极少 → 互补
+        if both_sub > max(1, either_sub // 8):
+            c += 1
+            continue
+        # 必须有一侧同格符偏多（避免乱并空列）
+        ditto_heavy = (
+            left_ditto >= 3 and left_ditto >= max(2, left_sub)
+        ) or (right_ditto >= 3 and right_ditto >= max(2, right_sub))
+        one_side_thin = (left_sub <= 2 and left_ditto >= 3) or (
+            right_sub <= 2 and right_ditto >= 3
+        )
+        if not (ditto_heavy or one_side_thin):
+            c += 1
+            continue
+
+        # 并入实质文本更多的一侧；平局并入左
+        keep = c if left_sub >= right_sub else c + 1
+        drop = c + 1 if keep == c else c
+        merge_right_into[drop] = keep
+        logger.info(
+            "TSR 同格符假列合并: col %d → %d (both_sub=%d either=%d ditto=%d/%d)",
+            drop,
+            keep,
+            both_sub,
+            either_sub,
+            left_ditto,
+            right_ditto,
+        )
+        c += 2
+
+    if not merge_right_into:
+        return cells
+
+    ghost = [c in merge_right_into for c in range(n_cols)]
+    remap = list(range(n_cols))
+    for g, tgt in merge_right_into.items():
+        remap[g] = tgt
+
+    survivors = [c for c in range(n_cols) if not ghost[c]]
+    if len(survivors) < 2:
+        return cells
+    old_to_new = {old: new for new, old in enumerate(survivors)}
+
+    def resolve_old(ci: int) -> int:
+        r = remap[ci]
+        guard = 0
+        while ghost[r] and remap[r] != r and guard < n_cols + 2:
+            r = remap[r]
+            guard += 1
+        return r
+
+    surv_left: Dict[int, float] = {}
+    surv_right: Dict[int, float] = {}
+    for s in survivors:
+        covered = [s] + [
+            g for g in range(n_cols) if ghost[g] and resolve_old(g) == s
+        ]
+        surv_left[s] = float(col_seps[min(covered)])
+        surv_right[s] = float(col_seps[max(covered) + 1])
+
+    out: List[Dict[str, Any]] = []
+    for cell in cells:
+        nc = dict(cell)
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        own_survivors = [i for i in range(cs, ce + 1) if not ghost[i]]
+        if own_survivors:
+            new_cs = min(old_to_new[i] for i in own_survivors)
+            new_ce = max(old_to_new[i] for i in own_survivors)
+        else:
+            mapped = [old_to_new[resolve_old(i)] for i in range(cs, ce + 1)]
+            new_cs, new_ce = min(mapped), max(mapped)
+        nc["col_start"] = new_cs
+        nc["col_end"] = new_ce
+        _refresh_spans(nc)
+        left_old = survivors[new_cs]
+        right_old = survivors[new_ce]
+        _x1, y1, _x2, y2 = _cell_bbox(cell)
+        nc["polygon"] = _rebuild_polygon(
+            surv_left[left_old], y1, surv_right[right_old], y2
+        )
+        if cs == ce and ghost[cs]:
+            nc["text"] = ""
+            nc["texts"] = []
+        out.append(nc)
+
+    logger.info(
+        "TSR 同格符假列合并: %d -> %d cols",
+        n_cols,
+        len(survivors),
+    )
+    return out
+
+
 def merge_ghost_rows(
     cells: List[Dict[str, Any]],
     boxes: Sequence[Dict[str, Any]],
@@ -1193,6 +1552,31 @@ def looks_shallow_body_rowspans(
     return max_body_rowspan(cells) <= 3
 
 
+def looks_row_undersegmented(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Sequence[Dict[str, Any]],
+) -> bool:
+    """
+    行欠切：OCR 框远多于逻辑行（与列数无关）。
+
+    覆盖窄高表（3 列 × 60 行被压成 4 行）——looks_shallow 要求 n_cols>=10 会漏检。
+    """
+    if not cells or not text_boxes:
+        return False
+    n_boxes = len(text_boxes)
+    if n_boxes < 24:
+        return False
+    _n_cols, n_rows, n_cells = cell_grid_stats(cells)
+    if n_rows <= 0:
+        return True
+    # 框数/行数过高，或格子极少
+    if n_rows <= max(4, n_boxes // 12):
+        return True
+    if n_cells < max(8, n_boxes // 10) and n_rows <= max(6, n_boxes // 8):
+        return True
+    return False
+
+
 def looks_overmerged_body_rowspans(
     cells: Sequence[Dict[str, Any]],
 ) -> bool:
@@ -1252,6 +1636,8 @@ def structure_quality_score(
     score = 0.28 * cov + 0.32 * cell_term + 0.25 * col_term + 0.15 * row_term
     if looks_undersegmented(cells, boxes):
         score *= 0.72
+    if looks_row_undersegmented(cells, boxes):
+        score *= 0.55
     if looks_oversegmented(cells, boxes):
         score *= 0.55
     return float(max(0.0, min(1.0, score)))
@@ -4962,6 +5348,10 @@ def refine_tsr_cells(
     cells = clip_narrow_label_colspans(cells)
     cells = dedupe_overlapping_cells(cells)
     cells = merge_ghost_columns(cells, boxes)
+    cells = dedupe_overlapping_cells(cells)
+    cells = merge_body_empty_columns(cells, boxes)
+    cells = dedupe_overlapping_cells(cells)
+    cells = merge_complementary_ditto_columns(cells, boxes)
     cells = dedupe_overlapping_cells(cells)
     cells = merge_ghost_rows(cells, boxes)
     cells = dedupe_overlapping_cells(cells)

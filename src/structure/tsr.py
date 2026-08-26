@@ -261,6 +261,38 @@ def _pick_finer_grid(
         )
         return primary
 
+    # 双方都过切时：行数已接近 OCR 期望的一侧更稳（避免 lineless 暴增行
+    # 再被 ghost-merge 压成几行巨格，如窄高多行表）
+    n_boxes = len(boxes)
+    if n_boxes >= 24 and pri_over and alt_over:
+        row_floor = max(8, n_boxes // 12)
+        if (
+            p_rows >= row_floor
+            and a_rows > p_rows * 1.75
+            and score_p >= 0.62
+        ):
+            logger.info(
+                "TSR 保留 %s（双方过切，行数更合理: %d vs %d，目标≥%d）",
+                primary_label,
+                p_rows,
+                a_rows,
+                row_floor,
+            )
+            return primary
+        if (
+            a_rows >= row_floor
+            and p_rows > a_rows * 1.75
+            and score_a >= 0.62
+        ):
+            logger.info(
+                "TSR 选用 %s（双方过切，行数更合理: %d→%d，目标≥%d）",
+                alt_label,
+                p_rows,
+                a_rows,
+                row_floor,
+            )
+            return alt
+
     # 主路径过切、对照不过切 → 换到对照（即使列更少）
     if pri_over and not alt_over and score_a >= score_p - 0.08:
         logger.info(

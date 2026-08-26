@@ -356,7 +356,27 @@ def refine_table(
     table: DetectedTable,
     boxes: Sequence[Dict[str, Any]],
 ) -> DetectedTable:
-    """对单表依次：文本聚类补列 → 拆错误纵向合并。"""
+    """对单表依次：文本聚类补列 → 拆错误纵向合并 → 同格符假列合并。"""
     table = split_columns_by_text_clusters(table, boxes)
     table = unmerge_row_spanned_cells(table, boxes)
-    return table
+    from .tsr_refine import (
+        cell_grid_stats,
+        merge_complementary_ditto_columns,
+        _derive_seps,
+    )
+
+    before_n = cell_grid_stats(table.cells)[0] if table.cells else 0
+    merged = merge_complementary_ditto_columns(list(table.cells), boxes)
+    after_n = cell_grid_stats(merged)[0] if merged else 0
+    if after_n >= before_n or after_n < 2:
+        return table
+    _rs, col_seps = _derive_seps(merged)
+    return DetectedTable(
+        cells=merged,
+        bbox=table.bbox,
+        row_seps=table.row_seps,
+        col_seps=col_seps if len(col_seps) >= 2 else table.col_seps,
+        confidence=table.confidence,
+        h_separators=table.h_separators,
+        v_separators=table.v_separators,
+    )

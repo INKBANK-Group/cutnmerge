@@ -153,11 +153,57 @@ def _is_standalone_short_header(text: str) -> bool:
     return bool(t and _STANDALONE_SHORT_HDR_RE.fullmatch(t))
 
 
+# 短完整同级列头常见收尾（卷边 / 配混量 / …性）
+_PEER_LABEL_TAIL_RE = re.compile(
+    r"(边|量|性|率|比|值|号|分|液|体|剂|物|基|素|称|类|型|目)$"
+)
+_LATIN_PEER_HEADER_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9/／.\-_]*$"
+)
+
+
+def _is_complete_peer_label(text: str) -> bool:
+    """
+    同级完整列头（含短 CJK / 拉丁编号），禁止被 vline 合并吞掉。
+
+    与 `_is_header_shard` 区分：酸催|化剂 仍走碎片合并；卷边、M2/M1、种类 视为完整标签。
+    """
+    t = _compact(text)
+    if not t:
+        return False
+    if _SUBHEADER_TYPE_RE.match(t):
+        return True
+    if _SUBHEADER_AMOUNT_RE.match(t) or t.startswith("配混量"):
+        return True
+    if _SUBHEADER_METRIC_RE.search(t):
+        return True
+    if _is_standalone_short_header(t):
+        return True
+    if _substantive_cjk_label(t):
+        return True
+    t_core = re.sub(r"[（(][^）)]*[）)]$", "", t)
+    if not t_core:
+        t_core = t
+    if _LATIN_PEER_HEADER_RE.fullmatch(t) or _LATIN_PEER_HEADER_RE.fullmatch(t_core):
+        return True
+    if _CJK_RE.search(t_core) and 2 <= len(t_core) <= 10:
+        if _PEER_LABEL_TAIL_RE.search(t_core):
+            return True
+        if len(t_core) >= 3 and not _PARENT_INCOMPLETE_TAIL_RE.search(t_core):
+            return True
+    return False
+
+
 def _looks_like_two_independent_subheaders(left_text: str, right_text: str) -> bool:
     """两侧 OCR 都像独立子表头时，禁止 colspan 合并。"""
     if _substantive_cjk_label(left_text) and _substantive_cjk_label(right_text):
         return True
     l, r = _compact(left_text), _compact(right_text)
+    if not l or not r:
+        return False
+    # 双侧完整同级标签（M2/M1|卷边、种类|配混量）→ 一律禁止合并
+    if _is_complete_peer_label(l) and _is_complete_peer_label(r):
+        return True
     # 一侧是短完整列头、另一侧仍有标签文本 → 禁止合并（P98 卤素列 vs 烯基）
     if _is_standalone_short_header(l) and (
         _substantive_cjk_label(r) or (_CJK_RE.search(r) and len(r) >= 2)
@@ -166,6 +212,11 @@ def _looks_like_two_independent_subheaders(left_text: str, right_text: str) -> b
     if _is_standalone_short_header(r) and (
         _substantive_cjk_label(l) or (_CJK_RE.search(l) and len(l) >= 2)
     ):
+        return True
+    # 一侧完整 peer、另一侧非空且非「可拼碎片」→ 仍禁止
+    if _is_complete_peer_label(l) and not _is_header_shard(r) and not _is_fragment_text(r):
+        return True
+    if _is_complete_peer_label(r) and not _is_header_shard(l) and not _is_fragment_text(l):
         return True
     return False
 
