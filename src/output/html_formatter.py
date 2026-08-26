@@ -80,6 +80,10 @@ _RECIPE_CODE_BODY_RE = re.compile(
     r"^(?:Bk|PI|PBO|PS|AC|CR|AE|MBA|PGMEA|NMP|GBL|DPHA|DPCA)[-－]?",
     re.IGNORECASE,
 )
+# 侧栏子行代号：A-1 / (A)-7 / B-12 等，与折行长标签碎片区分
+_SIDE_COMPONENT_INDEX_RE = re.compile(
+    r"^\(?[A-Za-z]{1,3}\)?\s*[-\u2013－]?\s*\d{1,3}$"
+)
 
 
 def _cell_key(cell: Dict[str, Any]) -> Tuple[int, int, int, int]:
@@ -986,6 +990,11 @@ def _collapse_header_empty_corners(cells: List[Dict[str, Any]]) -> List[Dict[str
         label = row_cells[label_idx]
         if _MONOMER_PARENT_LABEL_RE.search(str(label.get("text") or "")):
             continue
+        # 实施例/比较例列头锚定数据列，不得左扩进侧栏 stub。
+        # 否则会盖住表体 rowspan 行头，并把它们误判为「嵌套中层表头」从而把
+        # 整段表体当成表头带（上下 rowspan 散架）。
+        if _EXAMPLE_COL_HEADER_RE.search(str(label.get("text") or "")):
+            continue
         orig_cs = int(label["col_start"])
         absorbed: List[Dict[str, Any]] = []
         for j in range(label_idx):
@@ -1183,6 +1192,149 @@ def _should_merge_label_with_unit_tail(
     return _row_has_trailing_data_values(cells, row, int(label_cell["col_end"]))
 
 
+def _is_side_component_index_token(text: str) -> bool:
+    """左侧子列是否像组分代号（A-1 / (B)-4），而非折行标签碎片。"""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact:
+        return False
+    if _SIDE_COMPONENT_INDEX_RE.fullmatch(compact):
+        return True
+    if _LETTER_DATA_RE.fullmatch(compact):
+        return True
+    return False
+
+
+def _merge_split_body_side_labels(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """表体左侧行头区：把跨 col0|col1 被竖线误切的长标签拼回 colspan。
+
+    几何规则：仅在行头区（``col < first_data``）合并相邻有字格；右侧片段若像
+    ``A-1`` 等组分代号则保留分列（聚合物|A-1）。评价行「分辨|率评价」等不满足
+    代号形态，合并为一格。
+    """
+    if not cells:
+        return cells
+    first_data = _first_example_data_column(cells)
+    if first_data is None or first_data < 2:
+        return cells
+    header_end = _effective_header_end(cells)
+    _CJK = re.compile(r"[\u4e00-\u9fff]")
+
+    by_row: Dict[int, List[Dict[str, Any]]] = {}
+    for cell in cells:
+        if cell.get("_drop_render"):
+            continue
+        if int(cell["row_start"]) != int(cell["row_end"]):
+            continue
+        if int(cell["row_start"]) <= header_end:
+            continue
+        if int(cell["col_end"]) >= first_data:
+            continue
+        by_row.setdefault(int(cell["row_start"]), []).append(cell)
+
+    for row_cells in by_row.values():
+        row_cells.sort(key=lambda c: int(c["col_start"]))
+        i = 0
+        while i + 1 < len(row_cells):
+            left = row_cells[i]
+            right = row_cells[i + 1]
+            if int(right["col_start"]) != int(left["col_end"]) + 1:
+                i += 1
+                continue
+            if int(left.get("col_span") or 1) != 1 or int(right.get("col_span") or 1) != 1:
+                i += 1
+                continue
+            lt = str(left.get("text") or "").strip()
+            rt = str(right.get("text") or "").strip()
+            if not lt or not rt:
+                i += 1
+                continue
+            if not _CJK.search(lt) or not _CJK.search(rt):
+                i += 1
+                continue
+            if _is_side_component_index_token(rt) or _is_side_component_index_token(lt):
+                i += 1
+                continue
+            # 两侧皆为描述性 CJK → 同一行头被竖线切开
+            left["text"] = f"{lt}{rt}"
+            left["col_end"] = int(right["col_end"])
+            left["col_span"] = int(left["col_end"]) - int(left["col_start"]) + 1
+            try:
+                lx1, ly1, lx2, ly2 = _cell_physical_bbox_x_y(left)
+                rx1, ry1, rx2, ry2 = _cell_physical_bbox_x_y(right)
+                x1, y1 = min(lx1, rx1), min(ly1, ry1)
+                x2, y2 = max(lx2, rx2), max(ly2, ry2)
+                left["polygon"] = np.array(
+                    [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float64
+                )
+            except Exception:
+                pass
+            right["_drop_render"] = True
+            row_cells.pop(i + 1)
+            # 继续尝试向右吸收更多碎片（罕见）
+            continue
+    return [c for c in cells if not c.get("_drop_render")]
+
+
+def _retract_value_rowspan_across_side_indexes(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """表体数值格不得 rowspan 盖住带侧栏代号（A-2 / B-1）的行。
+
+    转置表常见：配混量 ``100`` 被 TSR 误扩到下一空行；侧栏已有 ``A-2`` 时
+    应收回为单行，留给空数据格。
+    """
+    if not cells:
+        return cells
+    header_end = _effective_header_end(cells)
+    first_data = _first_example_data_column(cells)
+    if first_data is None or first_data < 1:
+        return cells
+
+    index_rows: Set[int] = set()
+    for c in cells:
+        # 侧栏代号行：不要用 header_end 过滤——转置表左侧分类 rowspan
+        # 常把 he 误扩到身行，导致 A-2 被当成「表头」而漏检。
+        if int(c["col_start"]) >= first_data:
+            continue
+        t = str(c.get("text") or "").strip()
+        if not _is_side_component_index_token(t):
+            continue
+        for r in range(int(c["row_start"]), int(c["row_end"]) + 1):
+            index_rows.add(r)
+    if not index_rows:
+        return cells
+
+    for c in cells:
+        rs, re_ = int(c["row_start"]), int(c["row_end"])
+        if re_ <= rs:
+            continue
+        if int(c["col_start"]) < first_data:
+            continue
+        t = str(c.get("text") or "").strip()
+        if not t:
+            continue
+        compact = re.sub(r"\s+", "", t)
+        if not (
+            _DATA_VALUE_RE.fullmatch(compact)
+            or _LETTER_DATA_RE.fullmatch(compact)
+            or re.fullmatch(r"\d+(?:\.\d+)?", compact)
+        ):
+            continue
+        # 数值格起点若落在侧栏代号行上，或跨过后续代号行 → 收回
+        new_end = rs
+        for r in range(rs + 1, re_ + 1):
+            if r in index_rows:
+                break
+            new_end = r
+        # 起点本身是代号行（罕见）也钳回单行
+        if rs in index_rows and re_ > rs:
+            new_end = rs
+        if new_end < re_:
+            c["row_end"] = new_end
+            c["row_span"] = new_end - rs + 1
+    return cells
+
+
 def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """行首空列并入右侧中文标签格；同行「分辨率」+(μm) 合成单格。"""
     if not cells:
@@ -1257,18 +1409,43 @@ def _merge_leading_empty_into_label(cells: List[Dict[str, Any]]) -> List[Dict[st
     return [c for c in cells if not c.get("_drop_render")]
 
 
-def _cover_stub_column_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """行头区内：把空原子格与未覆盖逻辑格并入左侧同行标签，不跨数据列。"""
+def _cell_physical_bbox_x_y(cell: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
+    return float(poly[:, 0].min()), float(poly[:, 1].min()), float(poly[:, 0].max()), float(poly[:, 1].max())
+
+
+def _label_polygon_covers_neighbor(
+    label: Dict[str, Any],
+    neighbor: Dict[str, Any],
+    *,
+    min_cover: float = 0.5,
+) -> bool:
+    """标签物理框水平覆盖邻格宽度达到阈值 → 视为物理欠合并，可吸收。"""
+    lx1, _, lx2, _ = _cell_physical_bbox_x_y(label)
+    nx1, _, nx2, _ = _cell_physical_bbox_x_y(neighbor)
+    nw = nx2 - nx1
+    if nw <= 1e-6:
+        return False
+    overlap = max(0.0, min(lx2, nx2) - max(lx1, nx1))
+    return overlap >= min_cover * nw
+
+
+def _repair_row_header_coverage(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """行头区覆盖修复：补未覆盖逻辑洞；仅当多边形已盖住且列无实质内容时吸收空原子格。
+
+    不跨实施例数据列。真实空子列（他行同列有文本、或标签框未盖住）一律保留。
+    """
+    if not cells:
+        return cells
     first_data = _first_example_data_column(cells)
     if first_data is None or first_data <= 1:
         return cells
 
     header_end = _effective_header_end(cells)
+    work = [c for c in cells if not c.get("_drop_render")]
     occupancy: Dict[Tuple[int, int], Dict[str, Any]] = {}
     max_row = 0
-    for cell in cells:
-        if cell.get("_drop_render"):
-            continue
+    for cell in work:
         rs, re = int(cell["row_start"]), int(cell["row_end"])
         cs, ce = int(cell["col_start"]), int(cell["col_end"])
         max_row = max(max_row, re)
@@ -1298,17 +1475,26 @@ def _cover_stub_column_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 if nxt is not None and nxt.get("_drop_render"):
                     nxt = None
                 if nxt is None:
+                    # 纯逻辑洞：只扩 colspan，不删格
                     end = j
                     j += 1
                     continue
                 if nxt is owner:
                     j += 1
                     continue
-                if int(nxt["row_start"]) != row:
+                if int(nxt["row_start"]) != row or int(nxt["row_end"]) != row:
                     break
                 if str(nxt.get("text") or "").strip():
                     break
                 if int(nxt.get("col_span") or 1) != 1:
+                    break
+                # 列他处有实质内容 → 真实空子列，保留
+                if _column_has_data_values(work, j, skip_rows={row}):
+                    break
+                if _column_has_body_content(work, j, header_end, skip_rows={row}):
+                    break
+                # 标签物理框未盖住邻格 → 非欠合并，保留
+                if not _label_polygon_covers_neighbor(owner, nxt):
                     break
                 absorbed.append(nxt)
                 end = int(nxt["col_end"])
@@ -1321,76 +1507,12 @@ def _cover_stub_column_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 for c in range(int(owner["col_start"]), end + 1):
                     occupancy[(row, c)] = owner
             col = int(owner["col_end"]) + 1
-    return [c for c in cells if not c.get("_drop_render")]
-
-
-def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """把同行右侧连续空原子格并进左侧标签；身列已有数字的空格不吞。
-
-    能定位实施例列头时，只在行头区补 colspan（含未覆盖逻辑格），不跨数据列。
-    """
-    if not cells:
-        return cells
-    work = _cover_stub_column_gaps(cells)
-    first_data = _first_example_data_column(work)
-
-    by_row: Dict[int, List[Dict[str, Any]]] = {}
-    for cell in work:
-        if int(cell["row_start"]) != int(cell["row_end"]):
-            continue
-        by_row.setdefault(int(cell["row_start"]), []).append(cell)
-
-    for row_idx, row_cells in by_row.items():
-        row_cells.sort(key=lambda c: int(c["col_start"]))
-        if len(row_cells) < 2:
-            continue
-        first = row_cells[0]
-        if int(first["col_span"]) != 1 or not str(first.get("text") or "").strip():
-            continue
-        merge_until = int(first["col_end"])
-        absorbed: List[Dict[str, Any]] = []
-        for cell in row_cells[1:]:
-            if int(cell["col_span"]) != 1:
-                break
-            if str(cell.get("text") or "").strip():
-                break
-            col = int(cell["col_start"])
-            if first_data is not None and col >= first_data:
-                break
-            # 身列有数字或配方码（Bk-/PI- 等）时不吞——否则末行空 Bk 列会被标签 colspan 吃掉
-            if _column_has_data_values(work, col, skip_rows={row_idx}):
-                break
-            header_end = _effective_header_end(work)
-            if _column_has_body_content(work, col, header_end, skip_rows={row_idx}):
-                break
-            # 数据列左侧的空列常为排版幽灵列（P28 label|ghost|data），勿并进标签
-            if (
-                (
-                    _column_has_data_values(work, col + 1, skip_rows={row_idx})
-                    or _column_has_body_content(
-                        work, col + 1, header_end, skip_rows={row_idx}
-                    )
-                )
-                and not _column_has_data_values(work, col, skip_rows={row_idx})
-                and not _column_has_body_content(
-                    work, col, header_end, skip_rows={row_idx}
-                )
-            ):
-                break
-            merge_until = int(cell["col_end"])
-            absorbed.append(cell)
-        if not absorbed:
-            continue
-        first["col_end"] = merge_until
-        first["col_span"] = int(first["col_end"]) - int(first["col_start"]) + 1
-        for cell in absorbed:
-            cell["_drop_render"] = True
     return [c for c in work if not c.get("_drop_render")]
 
 
-def _cell_physical_bbox_x_y(cell: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
-    return float(poly[:, 0].min()), float(poly[:, 1].min()), float(poly[:, 0].max()), float(poly[:, 1].max())
+def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """行头区右侧覆盖：逻辑补洞 + 物理欠合并吸收（见 _repair_row_header_coverage）。"""
+    return _repair_row_header_coverage(cells)
 
 
 _KNOWN_LEAF_SUBHEADER_RE = re.compile(
@@ -3108,15 +3230,61 @@ def _occupied_by_col_row(
     return False
 
 
+def _newline_parts(text: str) -> List[str]:
+    return [p.strip() for p in str(text or "").split("\n") if p.strip()]
+
+
+def _stacked_example_body_labels(text: str) -> List[str]:
+    """左侧格堆叠的比较例/实施例身行标签（≥2 行）；否则空。"""
+    parts = _newline_parts(text)
+    if len(parts) < 2:
+        return []
+    if all(_HEADER_HAS_EXAMPLE_RE.search(p) for p in parts):
+        return parts
+    return []
+
+
+_BODYISH_PART_RE = re.compile(
+    r"\d|"
+    r"\([A-Za-z]\)\s*-|"
+    r"^[x×✗ⅹX]$|"
+    r"^[△▲Δ▽▼○◯〇◎●]$|"
+    r"^[良可可差]$|"
+    r"^[A-Da]$",
+)
+
+
+def _parts_look_bodyish(parts: Sequence[str]) -> bool:
+    """片段是否像表体数据（数值/代号/评价符号），而非表头词。"""
+    for p in parts:
+        t = re.sub(r"\s+", "", p)
+        if not t:
+            continue
+        if _HEADER_HAS_EXAMPLE_RE.search(t):
+            return True
+        if _looks_like_data_value(t) or _LETTER_DATA_RE.fullmatch(t):
+            return True
+        if _BODYISH_PART_RE.search(t):
+            return True
+    return False
+
+
 def _split_merged_example_body_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """拆开把多条比较例/实施例粘在同一逻辑行的情形（P29：比较例5\\n比较例6）。"""
+    """拆开把多条比较例/实施例粘在同一逻辑行的情形。
+
+    几何规则（不绑样本）：
+    - 左侧格有 ≥2 条堆叠比较例/实施例标签 → 身行数 n；
+    - 其它格若多出前缀行，视为粘进来的表头，先剥到上方表头行；
+    - 身段足 n 行则按行切开；仅 1 个数据值则 rowspan 盖住 n 行；
+    - 纯表头格（无数据片段）整段留在表头带，不拆进身行。
+    """
     if not cells:
         return cells
     work = [dict(c) for c in cells]
-    header_end = _effective_header_end(work)
     max_row = max(int(c["row_end"]) for c in work)
 
-    for row in range(max_row, header_end, -1):
+    row = max_row
+    while row >= 0:
         origins = [
             c
             for c in work
@@ -3124,54 +3292,149 @@ def _split_merged_example_body_rows(cells: List[Dict[str, Any]]) -> List[Dict[st
         ]
         nonempty = [c for c in origins if str(c.get("text") or "").strip()]
         if len(nonempty) < 2:
-            continue
-        part_lists = [
-            [p.strip() for p in str(c.get("text") or "").split("\n") if p.strip()]
-            for c in nonempty
-        ]
-        n = len(part_lists[0])
-        if n < 2 or any(len(p) != n for p in part_lists):
+            row -= 1
             continue
         leftmost = min(nonempty, key=lambda c: int(c["col_start"]))
-        labels = [
-            p.strip()
-            for p in str(leftmost.get("text") or "").split("\n")
-            if p.strip()
-        ]
-        if len(labels) != n:
+        labels = _stacked_example_body_labels(str(leftmost.get("text") or ""))
+        if len(labels) < 2:
+            row -= 1
             continue
-        if not all(_HEADER_HAS_EXAMPLE_RE.search(p) for p in labels):
+        n = len(labels)
+
+        # 各格拆成 header_prefix + body_parts
+        plan: List[Tuple[Dict[str, Any], List[str], List[str], str]] = []
+        # (cell, header_parts, body_parts, mode)
+        # mode: split | rowspan | header_only
+        header_depth = 0
+        for c in origins:
+            parts = _newline_parts(str(c.get("text") or ""))
+            if not parts:
+                plan.append((c, [], [], "empty"))
+                continue
+            if c is leftmost or id(c) == id(leftmost):
+                plan.append((c, [], parts, "split"))
+                continue
+            if not _parts_look_bodyish(parts):
+                # 纯表头粘连
+                header_depth = max(header_depth, len(parts))
+                plan.append((c, parts, [], "header_only"))
+                continue
+            if len(parts) > n:
+                hdr, body = parts[:-n], parts[-n:]
+                header_depth = max(header_depth, len(hdr))
+                plan.append((c, hdr, body, "split"))
+            elif len(parts) == n:
+                plan.append((c, [], parts, "split"))
+            elif len(parts) == 1:
+                plan.append((c, [], parts, "rowspan"))
+            else:
+                # 2..n-1：无法可靠对齐，跳过本行
+                plan = []
+                break
+        if not plan:
+            row -= 1
+            continue
+        # 左侧必须是 split 且恰好 n 条标签
+        if any(
+            (c is leftmost or id(c) == id(leftmost)) and mode != "split"
+            for c, _h, _b, mode in plan
+        ):
+            row -= 1
             continue
 
+        extra = header_depth + n - 1  # 本行变成 header_depth + n 行，净增
+        if extra < 0:
+            row -= 1
+            continue
+
+        # 下方行下移
         for c in work:
-            rs, re = int(c["row_start"]), int(c["row_end"])
+            rs, re_ = int(c["row_start"]), int(c["row_end"])
             if rs > row:
-                c["row_start"] = rs + n - 1
-                c["row_end"] = re + n - 1
+                c["row_start"] = rs + extra
+                c["row_end"] = re_ + extra
                 c["row_span"] = int(c["row_end"]) - int(c["row_start"]) + 1
-            elif rs <= row < re:
-                c["row_end"] = re + n - 1
+            elif rs <= row < re_:
+                c["row_end"] = re_ + extra
                 c["row_span"] = int(c["row_end"]) - int(c["row_start"]) + 1
 
         drop_ids = {id(c) for c in origins}
         new_cells: List[Dict[str, Any]] = []
-        for i in range(n):
-            for c in origins:
-                parts = [
-                    p.strip()
-                    for p in str(c.get("text") or "").split("\n")
-                    if p.strip()
-                ]
-                text_i = parts[i] if i < len(parts) else ""
+        body_start = row + header_depth
+
+        for c, hdr, body, mode in plan:
+            cs, ce = int(c["col_start"]), int(c["col_end"])
+            # 表头前缀（有身段的格）：底对齐放进 header 带
+            if mode == "split" and hdr and header_depth > 0:
+                for hi, text_i in enumerate(hdr):
+                    r_i = body_start - len(hdr) + hi
+                    if r_i < row:
+                        continue
+                    nc = dict(c)
+                    nc["row_start"] = r_i
+                    nc["row_end"] = r_i
+                    nc["row_span"] = 1
+                    nc["col_start"] = cs
+                    nc["col_end"] = ce
+                    nc["col_span"] = ce - cs + 1
+                    nc["text"] = text_i
+                    nc["texts"] = [text_i] if text_i else []
+                    new_cells.append(nc)
+            if mode == "header_only":
+                for hi, text_i in enumerate(hdr):
+                    r_i = body_start - len(hdr) + hi
+                    if r_i < row:
+                        continue
+                    nc = dict(c)
+                    nc["row_start"] = r_i
+                    nc["row_end"] = r_i
+                    nc["row_span"] = 1
+                    nc["col_start"] = cs
+                    nc["col_end"] = ce
+                    nc["col_span"] = ce - cs + 1
+                    nc["text"] = text_i
+                    nc["texts"] = [text_i] if text_i else []
+                    new_cells.append(nc)
+                continue
+            if mode == "rowspan":
+                text_i = body[0] if body else ""
                 nc = dict(c)
-                nc["row_start"] = row + i
-                nc["row_end"] = row + i
+                nc["row_start"] = body_start
+                nc["row_end"] = body_start + n - 1
+                nc["row_span"] = n
+                nc["text"] = text_i
+                nc["texts"] = [text_i] if text_i else []
+                new_cells.append(nc)
+                continue
+            if mode == "empty":
+                for i in range(n):
+                    nc = dict(c)
+                    nc["row_start"] = body_start + i
+                    nc["row_end"] = body_start + i
+                    nc["row_span"] = 1
+                    nc["text"] = ""
+                    nc["texts"] = []
+                    new_cells.append(nc)
+                continue
+            # split 身段
+            for i in range(n):
+                text_i = body[i] if i < len(body) else ""
+                nc = dict(c)
+                nc["row_start"] = body_start + i
+                nc["row_end"] = body_start + i
                 nc["row_span"] = 1
                 nc["text"] = text_i
                 nc["texts"] = [text_i] if text_i else []
                 new_cells.append(nc)
+
         work = [c for c in work if id(c) not in drop_ids] + new_cells
-        logger.info("拆粘连实施例身行: row=%d 拆成 %d 行", row, n)
+        logger.info(
+            "拆粘连实施例身行: row=%d → header=%d body=%d",
+            row,
+            header_depth,
+            n,
+        )
+        row -= 1
 
     return work
 
@@ -3681,20 +3944,39 @@ def _extend_header_end_for_unit_rows(
 _LONE_EXAMPLE_NUM_RE = re.compile(r"^\d+$")
 
 
-def _example_header_row_end(cells: Sequence[Dict[str, Any]]) -> int:
-    """含 ≥2 个实施例/比较例/参考例列头的最下行（无则 -1）。"""
-    by_row: Dict[int, int] = {}
+def _example_col_header_cols_in_row(
+    cells: Sequence[Dict[str, Any]], row: int
+) -> Set[int]:
+    """同行中「实施例/比较例」**列头**所占的列起点集合。
+
+    必须落在不同列：左侧身行标签（单列堆叠比较例1/2/3）不算列头横串。
+    """
+    cols: Set[int] = set()
     for c in cells:
+        if int(c["row_start"]) > row or int(c["row_end"]) < row:
+            continue
         t = str(c.get("text") or "").strip()
-        if not t or not _HEADER_HAS_EXAMPLE_RE.search(t):
+        if not t or _LONE_EXAMPLE_NUM_RE.fullmatch(t):
             continue
-        # 纯数字「10」不算；「实施例 1」「比较例 2」算
-        if _LONE_EXAMPLE_NUM_RE.fullmatch(t):
+        if not _HEADER_HAS_EXAMPLE_RE.search(t):
             continue
-        rs = int(c["row_start"])
-        by_row[rs] = by_row.get(rs, 0) + 1
-    hits = [r for r, n in by_row.items() if n >= 2]
-    return max(hits) if hits else -1
+        # 单格内多行比较例标签 → 身行，不是顶栏列头横串
+        parts = [p.strip() for p in t.split("\n") if p.strip()]
+        if len(parts) >= 2 and all(_HEADER_HAS_EXAMPLE_RE.search(p) for p in parts):
+            continue
+        cols.add(int(c["col_start"]))
+    return cols
+
+
+def _example_header_row_end(cells: Sequence[Dict[str, Any]]) -> int:
+    """含 ≥2 列实施例/比较例/参考例**列头**的最下行（无则 -1）。"""
+    by_row: Dict[int, Set[int]] = {}
+    max_r = max((int(c["row_end"]) for c in cells), default=-1)
+    for r in range(max_r + 1):
+        cols = _example_col_header_cols_in_row(cells, r)
+        if len(cols) >= 2:
+            by_row[r] = cols
+    return max(by_row) if by_row else -1
 
 
 def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
@@ -3725,33 +4007,15 @@ def _effective_header_end(cells: Sequence[Dict[str, Any]]) -> int:
     )
 
 
-def _repair_lone_example_number_headers(
-    cells: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """顶栏仅 OCR 出数字时，若同行已有实施例/比较例等列头，补回前缀。"""
-    header_end = _effective_header_end(cells)
-    has_example_peer = any(
-        _HEADER_HAS_EXAMPLE_RE.search(str(c.get("text") or ""))
-        for c in cells
-        if int(c["row_start"]) <= header_end
-    )
-    if not has_example_peer:
-        return cells
-
-    for c in cells:
-        if int(c["row_start"]) > header_end:
-            continue
-        t = str(c.get("text") or "").strip()
-        if not _LONE_EXAMPLE_NUM_RE.fullmatch(t):
-            continue
-        c["text"] = f"实施例 {t}"
-    return cells
-
-
 def _covered_by_upper_colspan_parent(
     cells: Sequence[Dict[str, Any]], cell: Dict[str, Any]
 ) -> bool:
-    """是否被正上方 colspan>1 父格覆盖（嵌套中层表头，如「树脂」子列）。"""
+    """是否被正上方 colspan>1 父格覆盖（嵌套中层表头，如「树脂」子列）。
+
+    不算嵌套父格的情况：
+    - 空角 colspan（转置表左上空白占位）——下方「(A)成分」等仍是表体 stub；
+    - 实施例/比较例列头即使 colspan>1——它们是数据列锚点。
+    """
     rs = int(cell["row_start"])
     cs, ce = int(cell["col_start"]), int(cell["col_end"])
     for p in cells:
@@ -3760,25 +4024,48 @@ def _covered_by_upper_colspan_parent(
             continue
         pcs, pce = int(p["col_start"]), int(p["col_end"])
         if pcs <= cs and pce >= ce and pce > pcs:
+            pt = str(p.get("text") or "").strip()
+            # 空角 colspan 不是嵌套父头；否则表头带会被左侧成分 rowspan 撑到身行
+            if not pt:
+                continue
+            if _EXAMPLE_COL_HEADER_RE.search(pt):
+                continue
             return True
     return False
+
+
+def _row_has_example_column_headers(
+    cells: Sequence[Dict[str, Any]], row: int
+) -> bool:
+    """该逻辑行是否含 ≥2 列实施例/比较例/参考例列头（非身行堆叠标签）。"""
+    return len(_example_col_header_cols_in_row(cells, row)) >= 2
 
 
 def _is_body_left_rowspan_stub(
     cells: Sequence[Dict[str, Any]], cell: Dict[str, Any]
 ) -> bool:
-    """表体左侧大行头 stub（比较例/实施例 rowspan），排除嵌套中层表头。"""
+    """表体左侧大行头 stub（比较例/实施例 rowspan），排除嵌套中层表头。
+
+    转置表常见：row0=实施例列头，row1 起左侧「聚合物」等分类 rowspan。
+    这类 stub 的 ``row_start`` 可为 1，不可再把表头带向下扩到数据行。
+    """
     rs, re = int(cell["row_start"]), int(cell["row_end"])
     cs = int(cell["col_start"])
-    if not (re > rs and rs >= 2 and cs <= 1):
+    if not (re > rs and rs >= 1 and cs <= 1):
         return False
     # P33：中层「树脂」rowspan 落在父「树脂」colspan 下，不是表体 stub
     if _covered_by_upper_colspan_parent(cells, cell):
         return False
     text = str(cell.get("text") or "").strip()
     if not text:
-        return True
+        # 空左侧 stub：rs>=2 仍截断；rs==1 仅当上一行已是实施例列头
+        if rs >= 2:
+            return True
+        return bool(rs >= 1 and _row_has_example_column_headers(cells, rs - 1))
     if _HEADER_HAS_EXAMPLE_RE.search(text):
+        return True
+    # 紧挨实施例列头行之下的左侧分类 rowspan（聚合物/化合物…）= 表体 stub
+    if rs >= 1 and _row_has_example_column_headers(cells, rs - 1):
         return True
     # 描述性中层表头（酸成分旁的「树脂」等）即使无父 colspan 也不截断表头带
     return False
@@ -4402,10 +4689,26 @@ _WRAP_HEADER_SUFFIX_RE = re.compile(
 _INDEPENDENT_HDR_TAIL_RE = re.compile(
     r"(剂|物|素|基|团|料|液|体|率|值|数|型|类|项|例|酸|胺|醇|醚|酮|醛|烃)$"
 )
+# 同列平行系列标签：聚合物A/聚合物B、化合物1/2（非折行）
+_PARALLEL_SERIES_LABEL_RE = re.compile(
+    r"^(?P<stem>[\u4e00-\u9fff]{2,10})"
+    r"(?P<idx>[A-Za-zＡ-Ｚａ-ｚ0-9０-９]+)$"
+)
 
 
 def _compact_header_text(text: str) -> str:
     return "".join((text or "").split())
+
+
+def _looks_like_parallel_series_labels(upper: str, lower: str) -> bool:
+    """同词干 + 不同尾缀序号/字母 → 平行行头，禁止当折行合并。"""
+    u = _compact_header_text(upper)
+    l = _compact_header_text(lower)
+    mu = _PARALLEL_SERIES_LABEL_RE.fullmatch(u)
+    ml = _PARALLEL_SERIES_LABEL_RE.fullmatch(l)
+    if not mu or not ml:
+        return False
+    return mu.group("stem") == ml.group("stem") and mu.group("idx") != ml.group("idx")
 
 
 def _looks_like_independent_header_label(text: str) -> bool:
@@ -4663,6 +4966,9 @@ def _looks_like_wrapped_header_pair(upper: str, lower: str) -> bool:
         return False
     if _lettered_parent_letter(lower) and not _lettered_parent_letter(upper):
         return False
+    # 聚合物A/B、化合物1/2：平行系列行头，不是折行
+    if _looks_like_parallel_series_labels(upper, lower):
+        return False
     if _is_header_phrase_continuation(upper, lower):
         return True
     u, l = _compact_hdr(upper), _compact_hdr(lower)
@@ -4866,6 +5172,10 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
                 _is_stacked_header_label(upper_text)
                 and _is_stacked_header_label(lower_text)
             ):
+                # 平行系列行头（聚合物A/B）禁止合并；其余沿用折行/边界启发式
+                if _looks_like_parallel_series_labels(upper_text, lower_text):
+                    out.append(upper)
+                    continue
                 # 独立双标签保持分列；折行短语对才合并
                 if (
                     int(lower["row_start"]) == header_end
@@ -4969,7 +5279,6 @@ def cells_to_html_table(
     work = _resolve_logic_overlaps(work)
     # 先丢掉全空幽灵行（P24 顶上空行），再算表头带 / 拆身列 colspan
     work = _drop_fully_empty_rows(work)
-    work = _repair_lone_example_number_headers(work)
     work = _drop_leading_header_only_columns(work)
     work = _split_label_over_data_columns(work)
     work = _extend_sparse_section_trailing_colspans(work)
@@ -4984,6 +5293,7 @@ def cells_to_html_table(
     work = repair_parent_header_topology(work, [])
     work = _drop_body_empty_columns(work)
     work = _merge_leading_empty_into_label(work)
+    work = _merge_split_body_side_labels(work)
     work = _merge_leading_label_gaps(work)
     work = drop_evidenceless_rows(work)
     work = _drop_fully_empty_rows(work)
@@ -5013,6 +5323,7 @@ def cells_to_html_table(
     work = _extend_composition_parent_colspan(work)
     work = _extend_sparse_section_trailing_colspans(work)
     work = _repair_room_storage_eval_headers(work)
+    work = _retract_value_rowspan_across_side_indexes(work)
     work = [c for c in work if not c.get("_drop_render")]
     if not work:
         return ""
@@ -5210,6 +5521,19 @@ _RECIPE_MARKER_RE = re.compile(
     r"\b(?:GBL|HMOM|PGMEA|NMP)\b|(?:^|[^A-Za-z])(?:A|B|C)-\d",
     re.IGNORECASE,
 )
+# 配方矩阵侧栏：成分代号 / 溶剂行标 / 分组父头（几何上应在表体左侧纵排）
+_COMPONENT_ROW_LABEL_RE = re.compile(
+    r"(?:"
+    r"\(?[A-Ea-e]\)?\s*[-－–]?\s*\d{1,2}"
+    r"|聚合物|引发剂|单体|溶剂|敏化剂|抑制剂|成分"
+    r"|NMP|GBL|DMSO"
+    r"|焦点|截面|电特性|合格|不合格"
+    r")"
+)
+# 横置 OCR 常见乱码碎片（非正常专利表词）
+_SIDEWAYS_OCR_GARBAGE_RE = re.compile(
+    r"(成\d|后房|品房|全房|房合|电话|产分|产\))"
+)
 
 
 def _html_td_plain(cell_html: str) -> str:
@@ -5240,6 +5564,49 @@ def _count_body_example_row_labels(rows: Sequence[Sequence[str]]) -> int:
     return n
 
 
+def _count_row0_example_labels(rows: Sequence[Sequence[str]]) -> int:
+    """首行实施例/比较例单元格数（配方矩阵列头的强信号）。"""
+    if not rows:
+        return 0
+    return sum(
+        1 for p in rows[0] if _EXAMPLE_LABEL_TOKEN_RE.search(p or "")
+    )
+
+
+def _count_body_component_row_labels(rows: Sequence[Sequence[str]]) -> int:
+    """
+    表体左侧（前两列）成分/溶剂/指标行标签数。
+
+    与「实施例作列头」正交：配方矩阵直立时侧栏纵排 (A)-1 / 聚合物 / NMP，
+    真侧躺碎表则侧栏多为数字或 OCR 乱码。
+    """
+    if len(rows) < 3:
+        return 0
+    n = 0
+    for plains in rows[1:]:
+        if not plains:
+            continue
+        left = " ".join(plains[:2])
+        if _EXAMPLE_LABEL_TOKEN_RE.search(left):
+            continue
+        if _COMPONENT_ROW_LABEL_RE.search(left):
+            n += 1
+    return n
+
+
+def _looks_like_composition_matrix(rows: Sequence[Sequence[str]]) -> bool:
+    """
+    几何拓扑：实施例横作列头 + 侧栏成分纵排 + 足够行数 → 正常配方矩阵，非侧躺。
+    """
+    row0_ex = _count_row0_example_labels(rows)
+    if row0_ex < 6:
+        return False
+    n_rows = len(rows)
+    if n_rows < 8:
+        return False
+    return _count_body_component_row_labels(rows) >= 4
+
+
 def html_structure_health(html_text: str) -> float:
     """
     表格结构健康分（越高越好）。定向重试时用于比较，避免「误报 broken 的好表」
@@ -5261,6 +5628,15 @@ def html_structure_health(html_text: str) -> float:
         score -= 15.0
     body_labels = _count_body_example_row_labels(rows)
     score += min(body_labels, 25) * 1.2
+    # 配方矩阵：实施例作列头 + 侧栏成分纵排（P186 类）
+    if _looks_like_composition_matrix(rows):
+        score += 18.0
+    else:
+        comp_side = _count_body_component_row_labels(rows)
+        row0_ex = _count_row0_example_labels(rows)
+        score += min(comp_side, 12) * 0.8
+        if row0_ex >= 6:
+            score += min(row0_ex, 20) * 0.35
     # 直立实验表：行数明显多于列数
     if n_rows >= 10 and n_rows >= n_cols:
         score += 6.0
@@ -5274,6 +5650,13 @@ def html_structure_health(html_text: str) -> float:
     recipe = len(_RECIPE_MARKER_RE.findall(table))
     if ex_all <= 1 and recipe >= 8 and n_cols >= 10:
         score -= 10.0
+    # 横置 OCR 乱码：无实施例/成分词却有大量「房/成N」碎片
+    garbage = len(_SIDEWAYS_OCR_GARBAGE_RE.findall(table))
+    if ex_all == 0 and garbage >= 3:
+        score -= 20.0
+    elif ex_all == 0 and n_rows >= 8 and not _NORMAL_TABLE_HEADER_RE.search(table):
+        # 大表却完全不见专利表头词 → 方向错误的强负分
+        score -= 12.0
     return score
 
 
@@ -5317,9 +5700,23 @@ def html_output_looks_broken(html_text: str) -> bool:
     if body_labels >= 5 and empty_tr < 5:
         return False
 
+    # 直立配方矩阵：实施例作列头 + 侧栏成分纵排 → 健康（勿当侧躺）
+    if _looks_like_composition_matrix(rows) and empty_tr < 5:
+        return False
+
     chunk = table[:2500]
     ex_hits = len(re.findall(r"实[施試]例", chunk))
     has_normal_header = bool(_NORMAL_TABLE_HEADER_RE.search(chunk))
+    comp_side = _count_body_component_row_labels(rows)
+
+    # 横置 OCR 乱码大表：无实施例/正常表头，却有大量「房/成N」碎片
+    if (
+        ex_hits == 0
+        and not has_normal_header
+        and len(_SIDEWAYS_OCR_GARBAGE_RE.findall(table)) >= 3
+        and n_rows >= 8
+    ):
+        return True
 
     # 误转 90° 配方倾倒：极少行 + 极多列 + 等级字母/溶剂堆，几乎无行标签
     if n_rows <= 6 and n_cols >= 12 and body_labels <= 1:
@@ -5343,18 +5740,16 @@ def html_output_looks_broken(html_text: str) -> bool:
             if shortish >= max(8, int(len(rows[0]) * 0.6)):
                 return True
 
-    # 仅当「实施例横排成列头」或「大量实施例却完全不见列头词」才判坏
-    # （表体行标签已在上方 early-return）
-    if ex_hits >= 8 and not has_normal_header and body_labels < 3:
+    # 仅当「大量实施例却完全不见列头词、也无侧栏成分」才判坏
+    # （表体行标签 / 配方矩阵已在上方 early-return）
+    if ex_hits >= 8 and not has_normal_header and body_labels < 3 and comp_side < 3:
         return True
 
     if rows:
         row0 = rows[0]
-        row0_ex = sum(
-            1 for p in row0 if _EXAMPLE_LABEL_TOKEN_RE.search(p or "")
-        )
-        # 首行连续多个「实施例」单元格（侧躺列头）
-        if row0_ex >= 6:
+        row0_ex = _count_row0_example_labels(rows)
+        # 首行多个「实施例」但侧栏无成分拓扑、且行很少 → 真侧躺列头
+        if row0_ex >= 6 and comp_side < 3 and n_rows <= 8:
             return True
         # 首行多数为纯数字/空，且整表缺少表头词 → 横置碎表
         num_or_empty = sum(
