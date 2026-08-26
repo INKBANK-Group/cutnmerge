@@ -4956,6 +4956,245 @@ def _is_header_phrase_continuation(upper: str, lower: str) -> bool:
     return False
 
 
+def _header_band_atomic_nonempty(
+    cells: Sequence[Dict[str, Any]], row: int
+) -> List[Dict[str, Any]]:
+    """表头带内某逻辑行的原子非空格。"""
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        if c.get("_drop_render"):
+            continue
+        if int(c["row_start"]) != row or int(c["row_end"]) != row:
+            continue
+        if str(c.get("text") or "").strip():
+            out.append(c)
+    return out
+
+
+def _is_wrap_artifact_header_band(
+    cells: Sequence[Dict[str, Any]], header_end: int
+) -> bool:
+    """顶表头带是否像「折行被切成假多行」而非真实嵌套二级表头。
+
+    典型：上行几乎无独立原子标签，下行有多列叶头，部分列 rowspan 跨整段
+    （介电/常数、来自R1…的比例）；上行无 colspan 父组头。
+    """
+    if header_end < 1 or header_end > 2:
+        return False
+    top = min(
+        (int(c["row_start"]) for c in cells if not c.get("_drop_render")),
+        default=0,
+    )
+    if header_end <= top:
+        return False
+
+    atomic_top = _header_band_atomic_nonempty(cells, top)
+    # 上行已有真实标签/父头 → 保留多级表头
+    if atomic_top:
+        if any(int(c["col_end"]) > int(c["col_start"]) for c in atomic_top):
+            return False
+        # 上行原子非空达到 2 列以上，更像真实二级
+        if len(atomic_top) >= 2:
+            return False
+
+    atomic_bot = _header_band_atomic_nonempty(cells, header_end)
+    if len(atomic_bot) < 2:
+        return False
+
+    tall_wraps = 0
+    for c in cells:
+        if c.get("_drop_render"):
+            continue
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if rs != top or re < header_end or re <= rs:
+            continue
+        if str(c.get("text") or "").strip():
+            tall_wraps += 1
+
+    # 楼梯形：上行空、下行有叶头；或夹杂折行 rowspan
+    return (not atomic_top) or tall_wraps >= 1
+
+
+def _collapse_wrap_artifact_header_band(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """把折行造成的假多行表头压成单行，保留格内换行文本。
+
+    几何规则：上行无独立叶头、无 colspan 父组；下行有多列叶头。将表头带内
+    各列文本收拢到 top 行，身行行号上移。
+    """
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    if not _is_wrap_artifact_header_band(cells, header_end):
+        return cells
+
+    work = [dict(c) for c in cells]
+    top = min(int(c["row_start"]) for c in work if not c.get("_drop_render"))
+    shift = header_end - top
+    if shift < 1:
+        return cells
+
+    # 按列范围归并表头带文本：同 (cs,ce) 取最长文本；跨行 rowspan 保留其文案
+    by_cols: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    drop_ids: Set[int] = set()
+    for c in work:
+        if c.get("_drop_render"):
+            continue
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if rs > header_end:
+            continue
+        if re < top:
+            continue
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        key = (cs, ce)
+        t = str(c.get("text") or "").strip()
+        prev = by_cols.get(key)
+        if prev is None:
+            by_cols[key] = c
+            continue
+        pt = str(prev.get("text") or "").strip()
+        # 有字优先于空格；更长文案优先；同等时保留跨行折行格
+        prev_span = int(prev["row_end"]) - int(prev["row_start"])
+        cur_span = re - rs
+        take_cur = False
+        if t and not pt:
+            take_cur = True
+        elif t and pt and len(t) > len(pt):
+            take_cur = True
+        elif t and pt and len(t) == len(pt) and cur_span > prev_span:
+            take_cur = True
+        elif not t and not pt and cur_span > prev_span:
+            take_cur = True
+        if take_cur:
+            drop_ids.add(id(prev))
+            by_cols[key] = c
+        else:
+            drop_ids.add(id(c))
+
+    for c in by_cols.values():
+        if id(c) in drop_ids:
+            continue
+        c["row_start"] = top
+        c["row_end"] = top
+        _refresh_cell_spans(c)
+
+    # 表头带内未被选中的格丢掉；身行上移
+    out: List[Dict[str, Any]] = []
+    for c in work:
+        if c.get("_drop_render") or id(c) in drop_ids:
+            continue
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        if re <= header_end and rs <= header_end:
+            # 仅保留已压到 top 的表头格
+            if rs == top and re == top:
+                out.append(c)
+            continue
+        if rs > header_end:
+            c["row_start"] = rs - shift
+            c["row_end"] = re - shift
+            _refresh_cell_spans(c)
+            out.append(c)
+            continue
+        # 跨界：缩到身段
+        c["row_start"] = max(top + 1, rs) - shift
+        c["row_end"] = re - shift
+        if int(c["row_end"]) < int(c["row_start"]):
+            continue
+        _refresh_cell_spans(c)
+        out.append(c)
+
+    logger.info(
+        "collapse_wrap_artifact_header_band: header_end %d→%d, cells %d→%d",
+        header_end,
+        top,
+        len(cells),
+        len(out),
+    )
+    return out
+
+
+_LEAKED_UNIT_BODY_RE = re.compile(
+    r"^(?P<unit>[\(（][^\)\n|]+[\)）])\s*[\n|]?\s*(?P<rest>\S.*)$",
+    re.DOTALL,
+)
+
+
+def _peel_leaked_header_units_from_body(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """首个表体行若以括号单位开头（如 (%)\\n73），把单位贴回正上方表头。
+
+    折行表头被切矮后，(%) 常落到第一身格；几何上单位应属表头叶。
+    """
+    if not cells:
+        return cells
+    header_end = _top_header_band_end(cells)
+    body_row = header_end + 1
+    work = [dict(c) for c in cells]
+    changed = 0
+
+    for c in work:
+        if c.get("_drop_render"):
+            continue
+        if int(c["row_start"]) != body_row or int(c["row_end"]) != body_row:
+            continue
+        raw = str(c.get("text") or "").strip()
+        if not raw:
+            continue
+        m = _LEAKED_UNIT_BODY_RE.match(raw)
+        if not m:
+            continue
+        unit = m.group("unit").strip()
+        rest = m.group("rest").strip()
+        if not _is_header_unit_line(unit):
+            continue
+        if not rest or not (
+            _looks_like_data_value(rest)
+            or re.match(r"^[\d\.]+", rest)
+            or re.match(r"^[○●◎△×✕✖]$", rest)
+        ):
+            continue
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        # 正上方表头：同行范围覆盖本列
+        header = None
+        for h in work:
+            if h.get("_drop_render") or h is c:
+                continue
+            hrs, hre = int(h["row_start"]), int(h["row_end"])
+            if hre < hrs or hre > header_end or hrs > header_end:
+                continue
+            if int(h["col_start"]) > cs or int(h["col_end"]) < ce:
+                continue
+            if not str(h.get("text") or "").strip():
+                continue
+            header = h
+            break
+        if header is None:
+            continue
+        ht = str(header.get("text") or "").strip()
+        unit_compact = "".join(unit.split())
+        if unit_compact and unit_compact in "".join(ht.split()):
+            c["text"] = rest
+            changed += 1
+            continue
+        # 贴到表头末尾：的比例 + (%) → 的比例(%)
+        if ht.endswith("\n") or not ht:
+            header["text"] = (ht + unit).strip()
+        else:
+            header["text"] = ht + unit
+        c["text"] = rest
+        changed += 1
+        logger.info(
+            "peel_leaked_header_unit: %r ← body %r → %r",
+            unit,
+            raw[:20],
+            rest[:20],
+        )
+
+    return work if changed else cells
+
+
 def _looks_like_wrapped_header_pair(upper: str, lower: str) -> bool:
     """上下非空标签像同一短语折行（非两个独立列头）。"""
     if _is_lettered_parent_over_leaf_subheader(upper, lower):
@@ -5316,6 +5555,8 @@ def cells_to_html_table(
     work = _ensure_composition_parent_header(work)
     work = _extend_composition_parent_colspan(work)
     work = _promote_tall_header_rowspans(work)
+    work = _collapse_wrap_artifact_header_band(work)
+    work = _peel_leaked_header_units_from_body(work)
     work = _split_stacked_header_rowspans(work)
     work = _repair_room_storage_eval_headers(work)
     work = _fold_acid_times_shard_column(work)

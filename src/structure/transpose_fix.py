@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 _EXAMPLE_LABEL_RE = re.compile(r"实[施試]例|比[较較]例|参考例")
 _COMPOSITION_HEADER_RE = re.compile(r"清漆|树脂|感光剂|溶剂|显影|判定|组成")
+_COMPONENT_SIDE_LABEL_RE = re.compile(
+    r"(?:"
+    r"\(?[A-Ea-e]\)?\s*[-－–]?\s*\d{1,2}"
+    r"|聚合物|引发剂|单体|溶剂|敏化剂|抑制剂|成分"
+    r"|NMP|GBL|DMSO"
+    r")"
+)
 _CAPTION_CELL_RE = re.compile(
     r"^[\[［【]?\s*表\s*[\d\-ー－]+\s*[\]］】]?$"
 )
@@ -162,19 +169,65 @@ def _example_labels_in_col0(
     return len(hit_cells)
 
 
+def _component_labels_in_left_cols(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+    *,
+    max_col: int = 2,
+) -> int:
+    """
+    左侧若干列上的成分/溶剂行标签数。
+
+    配方矩阵直立时侧栏纵排 (A)-1 / 聚合物 / NMP；真侧躺则这些词不在左侧。
+    """
+    hit_rows: set[int] = set()
+    for c in cells:
+        if int(c["col_start"]) > max_col:
+            continue
+        if int(c["row_start"]) <= 0:
+            continue
+        t = str(c.get("text") or "")
+        if _EXAMPLE_LABEL_RE.search(t):
+            continue
+        if _COMPONENT_SIDE_LABEL_RE.search(t):
+            hit_rows.add(int(c["row_start"]))
+    if hit_rows or not text_boxes:
+        return len(hit_rows)
+    for tb in text_boxes:
+        t = str(tb.get("text") or "")
+        if _EXAMPLE_LABEL_RE.search(t):
+            continue
+        if not _COMPONENT_SIDE_LABEL_RE.search(t):
+            continue
+        ctr = _tb_center(tb)
+        if ctr is None:
+            continue
+        cell = _cell_containing_point(cells, ctr[0], ctr[1])
+        if cell is None or int(cell["col_start"]) > max_col:
+            continue
+        if int(cell["row_start"]) <= 0:
+            continue
+        hit_rows.add(int(cell["row_start"]))
+    return len(hit_rows)
+
+
 def detect_sideways_row_labels(
     cells: Sequence[Dict[str, Any]],
     text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> bool:
     """
-    实施例/比较例应在首列纵排；若首行横排 ≥6 且首列几乎无同类标签，判定侧躺/行列颠倒。
+    实施例/比较例应在首列纵排的表被误转后，会变成首行横排。
 
+    例外：配方矩阵本身就是「实施例作列头 + 侧栏成分纵排」，不能当侧躺。
     覆盖 P57X445 等：误转 90° 后 TSR 碎成 60+ 行，旧版 detect 因 n_cols < n_rows*1.5 漏检。
     """
     if not cells or len(cells) < 10:
         return False
     row0_examples = _example_label_count(cells, row=0, text_boxes=text_boxes)
     if row0_examples < 6:
+        return False
+    # 侧栏已有足够成分拓扑 → 正常配方矩阵，勿转置
+    if _component_labels_in_left_cols(cells, text_boxes) >= 4:
         return False
     col0_examples = _example_labels_in_col0(cells, text_boxes=text_boxes)
     if col0_examples >= 3:
@@ -190,9 +243,16 @@ def detect_transposed_table(
     多信号门控：首行大量实施例/比较例、首列无同类标签、列数明显大于行数。
 
     注意：TSR 路径在 IoA 填字前调用本函数，必须能用 text_boxes 完成判定。
+    配方矩阵（实施例列头 + 侧栏成分）直接否决。
     """
     if not cells or len(cells) < 12:
         return False
+
+    # 配方矩阵直立拓扑：勿因「首行多实施例」误触发转置
+    if _component_labels_in_left_cols(cells, text_boxes) >= 4:
+        row0_examples = _example_label_count(cells, row=0, text_boxes=text_boxes)
+        if row0_examples >= 4:
+            return False
 
     if detect_sideways_row_labels(cells, text_boxes):
         return True
@@ -204,8 +264,13 @@ def detect_transposed_table(
 
     row0_examples = _example_label_count(cells, row=0, text_boxes=text_boxes)
     col0_examples = _example_labels_in_col0(cells, text_boxes=text_boxes)
-    # 碎网格侧躺：行数膨胀但首行仍横排实施例
-    if n_rows >= 30 and row0_examples >= 4 and row0_examples > col0_examples + 2:
+    # 碎网格侧躺：行数膨胀但首行仍横排实施例，且侧栏无成分拓扑
+    if (
+        n_rows >= 30
+        and row0_examples >= 4
+        and row0_examples > col0_examples + 2
+        and _component_labels_in_left_cols(cells, text_boxes) < 3
+    ):
         return True
 
     if n_cols < _MIN_ROW0_EXAMPLES:

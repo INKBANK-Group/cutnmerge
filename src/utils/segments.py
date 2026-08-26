@@ -30,6 +30,16 @@ _HEADER_JACCARD_THRESH = 0.28
 _SECTION_HEADER_RAW_RE = re.compile(
     r"(?<!形成)(?<!的)(?<!性)聚合物|单体\s*[\[［]"
 )
+# 侧栏配方成分名：聚合物2(g) / 聚合物 5(g) — 几何上落在行头 stub，不是换栏列头
+_BODY_POLYMER_INGREDIENT_RE = re.compile(
+    r"聚合物\s*\d+"  # 聚合物2 / 聚合物 5
+    r"|聚合物\s*[\(（]"  # 聚合物(g)
+    r"|聚合物\s*[A-Za-z]\w*"  # 聚合物A1 等
+)
+# 真正的列组换栏头：裸「聚合物」或「聚合物[质量份]」，不是编号成分
+_POLYMER_COLUMN_GROUP_RE = re.compile(
+    r"聚合物\s*[\[［]|聚合物(?!\s*\d)(?!\s*[\(（])(?!\s*[A-Za-z])"
+)
 _NUM_DATA_TOKEN_RE = re.compile(r"^[-–—−]?\d+(?:\.\d+)?$")
 _DATA_ROW_RE = re.compile(r"(合成例|实施例|実施例|比較例|比较例)\s*\d*")
 
@@ -58,8 +68,26 @@ def _jaccard(a: set, b: set) -> float:
     return inter / union if union else 0.0
 
 
+def _row_is_example_column_header_band(joined: str) -> bool:
+    """整行几乎只有多列「实施例N/比较例N」→ 顶栏列头，不算表体数据行。
+
+    转置配方表顶行常触发 ``_DATA_ROW_RE``；若据此置 ``segment_seen_data``，
+    下一行侧栏「聚合物5(g)」会被当成中段换栏而把表头/表体拆成两张表。
+    """
+    parts = [p.strip() for p in (joined or "").split() if p.strip()]
+    if len(parts) < 2:
+        return False
+    hits = sum(1 for p in parts if _DATA_ROW_RE.search(p))
+    return hits >= 2 and hits >= int(len(parts) * 0.6 + 0.999)
+
+
 def _row_is_midtable_section_header(joined: str) -> bool:
-    """本行是否为「聚合物 / 单体[」类中段分表头，而非表体计量/配方行。"""
+    """本行是否为「聚合物 / 单体[」类中段分表头，而非表体计量/配方行。
+
+    几何语义：
+    - 换栏列头：裸「聚合物」或「聚合物[…」/「单体[…」横跨数据列上方；
+    - 侧栏成分：``聚合物2(g)`` 落在行头 stub，不得切开同一张连续网格。
+    """
     s = (joined or "").strip()
     if not s or not _SECTION_HEADER_RAW_RE.search(s):
         return False
@@ -69,6 +97,12 @@ def _row_is_midtable_section_header(joined: str) -> bool:
     )
     # 同行右侧多列数值 → 表体数据行（如 Tg=123 跨实施例列）
     if num_data >= 3:
+        return False
+    # 仅有编号/带单位成分名、没有列组换栏头 → 侧栏配方行
+    has_monomer_hdr = bool(re.search(r"单体\s*[\[［]", s))
+    has_poly_group = bool(_POLYMER_COLUMN_GROUP_RE.search(s))
+    has_body_poly = bool(_BODY_POLYMER_INGREDIENT_RE.search(s))
+    if has_body_poly and not has_monomer_hdr and not has_poly_group:
         return False
     return True
 
@@ -169,7 +203,10 @@ def find_row_segments(
             row_cells, y_top=y_top, y_bot=y_bot, text_boxes=text_boxes
         )
         toks = _tokenize_row_text(joined)
-        is_data_row = bool(_DATA_ROW_RE.search(joined))
+        # 顶栏多列「实施例N」不算表体；否则会误触发后续「聚合物N(g)」换栏切开
+        is_data_row = bool(_DATA_ROW_RE.search(joined)) and not (
+            _row_is_example_column_header_band(joined)
+        )
         is_section_hdr = _row_is_midtable_section_header(joined)
         is_caption = bool(_HEADER_CAPTION_RE.search(joined))
         should_split = False

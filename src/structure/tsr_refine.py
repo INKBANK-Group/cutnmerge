@@ -22,6 +22,9 @@ _CJK_RE = re.compile(
 )
 # 【新增】支持 2-3 个大写字母或字母加数字的合法代码识别
 _LETTER_DATA_RE = re.compile(r"^(?:[A-Za-z][+＋]?|[A-Z]{2,3}|[A-Za-z]\d{1,2})$")
+_STACKED_EXAMPLE_LABEL_RE = re.compile(
+    r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)\s*\d*"
+)
 
 
 def _tb_bbox(tb: Dict[str, Any]) -> Tuple[float, float, float, float]:
@@ -336,8 +339,11 @@ def _robust_main_size(sizes: Sequence[float]) -> float:
     """
     估计真实主列/主行尺寸。
 
-    双线框会产出大量 ~线宽缝隙（常约 8~20px）。若直接对全部宽度取中位数，
+    双线框会产出大量 ~线宽缝隙（常约 4~10px）。若直接对全部宽度取中位数，
     缝会主导 median，导致剩余缝再也判不成「窄」。只取明显大于缝阈的主尺寸。
+
+    紧凑有线表（行高 ~16–20px）若用过高绝对缝阈（如 20），会把几乎全部
+    身行滤掉，只剩题注/大行头，主尺寸被抬高后反而把真身行判成缝。
     """
     vals = [float(s) for s in sizes if float(s) > 0]
     if not vals:
@@ -346,6 +352,13 @@ def _robust_main_size(sizes: Sequence[float]) -> float:
     # 缝阈：绝对下限 + 相对最大主尺寸的一小部分
     seam_cap = max(20.0, 0.12 * vmax)
     main = [v for v in vals if v >= seam_cap]
+    # 主样本过少（常见：题注一行偏高，身行全落在 cap 下）→ 放宽到线宽量级
+    need = max(3, (len(vals) + 3) // 4)
+    if len(main) < need:
+        loose_cap = max(8.0, 0.06 * vmax)
+        loose = [v for v in vals if v >= loose_cap]
+        if len(loose) >= need or (len(loose) > len(main) and len(loose) >= 2):
+            main = loose
     if len(main) >= 2:
         return float(np.median(main))
     if main:
@@ -354,10 +367,13 @@ def _robust_main_size(sizes: Sequence[float]) -> float:
 
 
 def _is_double_line_seam(size: float, main_size: float) -> bool:
-    """双线框缝：远小于主尺寸（或绝对像素极窄）。"""
+    """双线框缝：远小于主尺寸（真缝约线宽 4–10px，不是半行高）。
+
+    绝对下限取 10（旧值 18 会把紧凑有线表 ~16–18px 身行误判为缝）。
+    """
     if main_size <= 1e-6:
         return False
-    return float(size) < max(18.0, 0.10 * float(main_size))
+    return float(size) < max(10.0, 0.10 * float(main_size))
 
 
 def merge_ghost_columns(
@@ -923,9 +939,22 @@ def merge_ghost_rows(
                 return True
         return False
 
+    def _row_has_substance(r: int) -> bool:
+        """行内有非碎片 OCR → 不可能是双线缝（缝里不应有实质正文）。"""
+        return any(not _looks_like_ocr_fragment(t) for t in row_texts[r])
+
     ghost = []
     for r in range(n_rows):
+        # 双线缝：几何上极窄。但若该行已有实质 OCR，说明主尺寸/阈值误判，
+        # 不可无条件吞掉（紧凑有线专利表行高常 ~16–20px，易踩旧 18px 绝对阈）。
         if _is_double_line_seam(heights[r], median_h):
+            if _row_has_substance(r):
+                ghost.append(False)
+            else:
+                ghost.append(True)
+            continue
+        # 无文本且明显矮于主行高：表底/双线残留空带（可高于绝对缝阈 10px）
+        if hits[r] == 0 and heights[r] < 0.75 * median_h:
             ghost.append(True)
             continue
         short = heights[r] < min_height_ratio * median_h
@@ -941,6 +970,7 @@ def merge_ghost_rows(
         ghost.append(bool(only_frag and _neighbor_has_substance(r)))
     if not any(ghost):
         return cells
+
 
     remap = list(range(n_rows))
     for r in range(n_rows):
@@ -1723,11 +1753,34 @@ def split_underspanned_rows(
         else:
             break
 
+    def _row_has_stacked_example_labels(r: int) -> bool:
+        """左侧出现 ≥2 条比较例/实施例标签 → 该行含粘连身行，即使像表头也允许切。"""
+        y0, y1 = row_seps[r], row_seps[r + 1]
+        table_w = float(col_seps[-1] - col_seps[0]) if len(col_seps) >= 2 else 1.0
+        left_x = float(col_seps[0]) + max(24.0, 0.18 * table_w)
+        ys: List[float] = []
+        for tb in boxes:
+            bx1, by1, bx2, by2 = _tb_bbox(tb)
+            mx, my = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+            if mx > left_x:
+                continue
+            if not (y0 <= my < y1 or (r == n_rows - 1 and y0 <= my <= y1)):
+                continue
+            t = str(tb.get("text") or "").strip()
+            if t and _STACKED_EXAMPLE_LABEL_RE.search(t):
+                ys.append(my)
+        if len(ys) < 2:
+            return False
+        ys.sort()
+        # 两个标签中心须有可分辨竖直间隙（非同一 OCR 框重复）
+        return any((ys[i + 1] - ys[i]) >= max(4.0, 0.35 * median_box_h) for i in range(len(ys) - 1))
+
     # splits: row_idx -> list of split_y ascending
     row_splits: Dict[int, List[float]] = {}
 
     for r in range(n_rows):
-        if r < header_until:
+        # 表头带默认不切；但表头与身行粘在同一逻辑行（比较例1/2 叠在左侧）时仍切
+        if r < header_until and not _row_has_stacked_example_labels(r):
             continue
         y0, y1 = row_seps[r], row_seps[r + 1]
         row_h = y1 - y0

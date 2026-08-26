@@ -677,19 +677,55 @@ def _extract_via_tsr(
                     )
                 )
             if shallow and not undermerge:
-                line_overmerge = looks_overmerged_body_rowspans(line_cells)
-                score_lines = structure_quality_score(line_cells, text_boxes)
+                # 多子表时勿用拼接格做 rowspan/过合并判定（各表 row 索引从 0 起会撞车）
+                table_list = [
+                    list(getattr(t, "cells", None) or [])
+                    for t in (tables or [])
+                    if getattr(t, "cells", None)
+                ]
+                if len(table_list) >= 2:
+                    line_overmerge = any(
+                        looks_overmerged_body_rowspans(tc) for tc in table_list
+                    )
+                    line_rs = max(max_body_rowspan(tc) for tc in table_list)
+                    per_stats = [cell_grid_stats(tc) for tc in table_list]
+                    total_lr = sum(s[1] for s in per_stats)
+                    lc_use = int(round(sum(s[0] for s in per_stats) / len(per_stats)))
+                    # 各子表自身质量分取优（拼接格的 score 因行号重叠会失真）
+                    score_lines = max(
+                        structure_quality_score(tc, text_boxes) for tc in table_list
+                    )
+                else:
+                    line_overmerge = looks_overmerged_body_rowspans(line_cells)
+                    line_rs = max_body_rowspan(line_cells)
+                    total_lr = lr
+                    lc_use = lc
+                    score_lines = structure_quality_score(line_cells, text_boxes)
                 score_tsr = structure_quality_score(cells, text_boxes)
-                line_rs = max_body_rowspan(line_cells)
                 tsr_rs = max_body_rowspan(cells)
-                # 框线须明显恢复贯通 rowspan，且未通天糊列
+                # shallow 启发式在「合法 max rowspan≤3」的有线表上也会触发；
+                # 不能只认「恢复出 ≥5 的贯通 rowspan」，否则会拒收几何上更好的框线网格，
+                # 随后 TSR 还可能被误转置（多行首行实施例 → 行列颠倒）。
+                rowspan_recovered = line_rs >= max(5, tsr_rs + 2)
+                grid_plausible = total_lr >= 4 and 6 <= lc_use <= 22
+                score_ok = score_lines >= score_tsr - 0.12
+                score_better = score_lines >= score_tsr + 0.05
+                multi_coherent = (
+                    len(table_list) >= 2
+                    and all(cell_grid_stats(tc)[1] >= 8 for tc in table_list)
+                    and all(6 <= cell_grid_stats(tc)[0] <= 22 for tc in table_list)
+                )
                 accept = (
                     not line_overmerge
-                    and lr >= 4
-                    and 6 <= lc <= 22
-                    and line_rs >= max(5, tsr_rs + 2)
-                    and score_lines >= score_tsr - 0.12
+                    and grid_plausible
+                    and (
+                        (rowspan_recovered and score_ok)
+                        or (score_better and total_lr >= max(8, int(n_rows * 0.35)))
+                        or (multi_coherent and score_ok)
+                    )
                 )
+                # 日志用合计行/代表列，避免多表拼接误导
+                lr, lc = total_lr, lc_use
             if row_under and not overseg and not undermerge:
                 # 行欠切：框线若恢复大量行且自身不再欠切，即使质量分略低也采纳
                 # （巨格假高覆盖会使 TSR 的 structure_quality_score 虚高）
@@ -1164,7 +1200,26 @@ def extract_table_output(
     if _allow_orient_retry and html_output_looks_broken(html):
         retry_angles: list = []
         if can_retry_upright:
-            retry_angles.append(0)
+            # 几何：当前已是「横线主导的宽表」= 侧躺原图已转正。
+            # 回退 0° 只会回到窄高侧躺图，把好结果换成 OCR 乱码。
+            from ..preprocess.orient import _grid_line_strengths
+
+            ih, iw = image.shape[:2]
+            hs, vs = _grid_line_strengths(image)
+            already_upright_wide = (
+                iw >= ih
+                and hs >= 0.004
+                and hs >= vs * 0.55
+            )
+            if already_upright_wide:
+                logger.info(
+                    "跳过 0° 回退：当前网格已直立宽表 (orient=%s hs=%.4f vs=%.4f)",
+                    orient_angle,
+                    hs,
+                    vs,
+                )
+            else:
+                retry_angles.append(0)
         if can_retry_sideways:
             # OCR 已直立时强行试 90/270 极易把正常竖表拧成配方倾倒宽表
             if looks_sideways(text_boxes):
