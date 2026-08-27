@@ -1,6 +1,10 @@
 """表格图像方向归正：投影剖面定轴向 + OCR 置信度消歧 180°。
 
 必须在 OCR 之前完成轴向旋转；180° 消歧可在首次 OCR 之后按需再跑一次。
+
+独立 CLI 用法（纠正结果原地覆盖原图，原图不可恢复）:
+    python src/preprocess/orient.py           # 批量纠正 data/input/ 下全部图片
+    python src/preprocess/orient.py 图片路径   # 仅纠正该图片
 """
 
 from __future__ import annotations
@@ -584,3 +588,134 @@ def correct_orientation(
     )
     total = (angle + flip) % 360
     return image, total, boxes
+
+
+def cli_main(argv: Optional[List[str]] = None) -> int:
+    """
+    命令行入口：python orient.py [图片路径]
+
+    - 无参数：批量纠正 data/input/ 下全部图片的方向（原地覆盖原图）
+    - 带路径：仅纠正该图片（原地覆盖）
+
+    依赖 .env 中的 PADDLEOCR_ACCESS_TOKEN（云端 OCR 消歧 180°）。
+    """
+    import argparse
+    import sys
+    from pathlib import Path
+
+    from src.core.config import load_env
+    from src.core.models import load_ocr
+    from src.utils.image_io import imread_unicode, imwrite_unicode
+
+    ROOT = Path(__file__).resolve().parents[2]
+    INPUT_DIR = ROOT / "data" / "input"
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+    parser = argparse.ArgumentParser(
+        description="表格图像方向归正：纠正后原地覆盖原图（原图不可恢复，请先备份）",
+    )
+    parser.add_argument(
+        "path",
+        type=str,
+        nargs="?",
+        default=None,
+        help="图片路径；省略时批量纠正 data/input/ 下全部图片",
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true", help="禁用 OCR 本地缓存，每次都请求云端"
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="强制重新请求云端 OCR 并覆盖本地缓存",
+    )
+    args = parser.parse_args(argv)
+
+    if args.path:
+        path = Path(args.path)
+        if not path.is_file():
+            alt = ROOT / args.path
+            if alt.is_file():
+                path = alt
+            else:
+                print(f"错误: 找不到图片 {args.path}", file=sys.stderr)
+                return 1
+        images = [path]
+    else:
+        if not INPUT_DIR.is_dir():
+            print(f"错误: 默认输入目录不存在: {INPUT_DIR}", file=sys.stderr)
+            return 1
+        images = sorted(
+            p
+            for p in INPUT_DIR.iterdir()
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+        )
+        if not images:
+            print(f"错误: {INPUT_DIR} 下没有图片", file=sys.stderr)
+            return 1
+
+    # 仅展示本模块的方向判定日志（如「方向轴向 OCR 比对」），
+    # 其余模块保持默认 WARNING，避免云端 OCR 轮询日志刷屏
+    orient_logger = logging.getLogger(__name__)
+    if not orient_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        orient_logger.addHandler(handler)
+        orient_logger.setLevel(logging.INFO)
+        orient_logger.propagate = False
+
+    print(f"[info] 将纠正 {len(images)} 张图片并原地覆盖原图（原图不可恢复，请先备份）")
+    try:
+        load_env()
+        ocr = load_ocr()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"错误: OCR 初始化失败（请检查 .env 的 PADDLEOCR_ACCESS_TOKEN）: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    ok, rotated, failed = 0, 0, 0
+    for i, img_path in enumerate(images, start=1):
+        print(f"[info] ({i}/{len(images)}) {img_path.name}")
+        try:
+            image = imread_unicode(str(img_path))
+            if image is None:
+                raise RuntimeError("图片读取失败")
+            corrected, total_angle, _ = correct_orientation(
+                image,
+                ocr_engine=ocr,
+                use_cache=not args.no_cache,
+                refresh_cache=args.refresh_cache,
+            )
+            if total_angle == 0:
+                print("[info]   方向已正确，无需旋转")
+            else:
+                if not imwrite_unicode(str(img_path), corrected):
+                    raise RuntimeError("图片写入失败")
+                print(f"[info]   已旋转 {total_angle}° 并覆盖: {img_path.name}")
+                rotated += 1
+            ok += 1
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            print(f"[error] 处理失败 {img_path.name}: {exc}", file=sys.stderr)
+            import traceback
+
+            traceback.print_exc()
+
+    print(f"[info] 完成: 成功 {ok}（旋转 {rotated} 张），失败 {failed}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    # 以脚本方式直接运行（python orient.py）时：
+    # 1) 把项目根目录加入 sys.path，使包内绝对导入可用；
+    # 2) 以包内模块身份重新导入本模块——否则本模块内部的
+    #    "from ..core.models import ..." 相对导入会因无父包而失败。
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from src.preprocess.orient import cli_main as _run_cli
+
+    raise SystemExit(_run_cli())

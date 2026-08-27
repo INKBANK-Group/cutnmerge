@@ -41,6 +41,8 @@ venv\Scripts\python main.py --orientation auto
 venv\Scripts\python main.py --no-cache
 venv\Scripts\python main.py --refresh-cache
 venv\Scripts\python main.py --no-vis
+venv\Scripts\python src\preprocess\orient.py            # 独立方向纠正：data/input/ 全部图片（原地覆盖）
+venv\Scripts\python src\preprocess\orient.py 图片路径   # 仅纠正该图片（原地覆盖）
 ```
 
 | 参数 | 说明 |
