@@ -261,9 +261,26 @@ def _pick_finer_grid(
         )
         return primary
 
+    # 主路径覆盖好且列数合理时，拒绝对照列数暴涨（假细切，常见于有线表误切 lineless）
+    n_boxes = len(boxes)
+    if (
+        score_p >= 0.85
+        and not pri_over
+        and p_cols >= 3
+        and a_cols >= max(int(p_cols * 2.5), p_cols + 8)
+        and a_cols > max(12, n_boxes // 3 if n_boxes else 12)
+    ):
+        logger.info(
+            "TSR 保留 %s（拒绝对照列暴涨: %d→%d, cov=%.3f）",
+            primary_label,
+            p_cols,
+            a_cols,
+            score_p,
+        )
+        return primary
+
     # 双方都过切时：行数已接近 OCR 期望的一侧更稳（避免 lineless 暴增行
     # 再被 ghost-merge 压成几行巨格，如窄高多行表）
-    n_boxes = len(boxes)
     if n_boxes >= 24 and pri_over and alt_over:
         row_floor = max(8, n_boxes // 12)
         if (

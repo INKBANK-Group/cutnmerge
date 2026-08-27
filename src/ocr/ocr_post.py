@@ -52,6 +52,8 @@ def normalize_ocr_text(text: str) -> str:
     if re.fullmatch(r"[\-\s]+", t):
         return "-"
     t = fix_iii_ocr(t)
+    # 「实施例」中「施」常被误成族/场/路（形近）
+    t = re.sub(r"实[族场路]例", "实施例", t)
     # 叠放等级常见误序：A+/0 → "+0"
     if t in {"+0", "0+"}:
         return "0\nA+"

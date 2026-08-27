@@ -20,6 +20,7 @@ _COMPONENT_SIDE_LABEL_RE = re.compile(
     r"(?:"
     r"\(?[A-Ea-e]\)?\s*[-－–]?\s*\d{1,2}"
     r"|聚合物|引发剂|单体|溶剂|敏化剂|抑制剂|成分"
+    r"|树脂|色素|粘结|固化|感光|分散|组合物|聚合性|近红外|滤光|添加剂"
     r"|NMP|GBL|DMSO"
     r")"
 )
@@ -211,6 +212,34 @@ def _component_labels_in_left_cols(
     return len(hit_rows)
 
 
+def _example_labels_spread_in_row0(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> int:
+    """首行实施例标签分散在多少逻辑列（列头矩阵 vs 侧躺横排）。"""
+    cols: set[int] = set()
+    for c in cells:
+        if int(c["row_start"]) != 0 or int(c["row_end"]) != 0:
+            continue
+        if _EXAMPLE_LABEL_RE.search(str(c.get("text") or "")):
+            cols.add(int(c["col_start"]))
+    if cols or not text_boxes:
+        return len(cols)
+    for tb in text_boxes:
+        if not _EXAMPLE_LABEL_RE.search(str(tb.get("text") or "")):
+            continue
+        ctr = _tb_center(tb)
+        if ctr is None:
+            continue
+        cell = _cell_containing_point(cells, ctr[0], ctr[1])
+        if cell is None:
+            continue
+        if int(cell["row_start"]) != 0 or int(cell["row_end"]) != 0:
+            continue
+        cols.add(int(cell["col_start"]))
+    return len(cols)
+
+
 def detect_sideways_row_labels(
     cells: Sequence[Dict[str, Any]],
     text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
@@ -226,8 +255,11 @@ def detect_sideways_row_labels(
     row0_examples = _example_label_count(cells, row=0, text_boxes=text_boxes)
     if row0_examples < 6:
         return False
+    # 实施例分散在首行多列 → 正常「实施例作列头」矩阵（P38/P39 类）
+    if _example_labels_spread_in_row0(cells, text_boxes) >= 4:
+        return False
     # 侧栏已有足够成分拓扑 → 正常配方矩阵，勿转置
-    if _component_labels_in_left_cols(cells, text_boxes) >= 4:
+    if _component_labels_in_left_cols(cells, text_boxes) >= 3:
         return False
     col0_examples = _example_labels_in_col0(cells, text_boxes=text_boxes)
     if col0_examples >= 3:
@@ -249,9 +281,14 @@ def detect_transposed_table(
         return False
 
     # 配方矩阵直立拓扑：勿因「首行多实施例」误触发转置
-    if _component_labels_in_left_cols(cells, text_boxes) >= 4:
+    if _component_labels_in_left_cols(cells, text_boxes) >= 3:
         row0_examples = _example_label_count(cells, row=0, text_boxes=text_boxes)
         if row0_examples >= 4:
+            return False
+    if _example_labels_spread_in_row0(cells, text_boxes) >= 4:
+        max_row = max(int(c["row_end"]) for c in cells)
+        max_col = max(int(c["col_end"]) for c in cells)
+        if max_col + 1 <= max_row + 1:  # 列数不多于行数：典型实施例列头表
             return False
 
     if detect_sideways_row_labels(cells, text_boxes):

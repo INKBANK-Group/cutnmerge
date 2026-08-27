@@ -9,7 +9,7 @@ from typing import List, Optional, Sequence, Tuple
 _INDEPENDENT_LABEL_RE = re.compile(
     r"^(?:"
     r"(?:实[施試]例|实[施試]形態|実施例|比較例|比较例|合成例|对照例|参考例|態様)"
-    r"[IVXivx０-９\d]+|"
+    r"\s*[IVXivx０-９\d]+|"
     r"(?:iii|ii|i|III|II|I|ｌｉｉ|ｌｉ)[-－]?\d+|"
     r"(?:OXL|OXE|OX)[-－]?[A-Za-z0-9]+|"
     r"\([A-Z]{2}\)|"
@@ -55,12 +55,59 @@ def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", "", (text or "").strip())
 
 
+def expand_slash_example_labels(text: str) -> List[str]:
+    """「実施例26/27/28」或「実施例 36/37」→ 独立标签列表。"""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    if "/" not in raw and "／" not in raw:
+        return [raw]
+    compact = re.sub(r"\s+", "", raw)
+    m = re.match(
+        r"^(実施例|比較例|比较例|合成例|实施例|对照例|参考例)(\d+)((?:[/／]\d+)*)$",
+        compact,
+    )
+    if m:
+        prefix, first, rest = m.group(1), m.group(2), m.group(3)
+        nums = [first, *re.findall(r"\d+", rest)]
+        return [f"{prefix}{n}" for n in nums]
+    return [p.strip() for p in re.split(r"[/／]", raw) if p.strip()]
+
+
 def is_independent_row_label(text: str) -> bool:
     """单行文本是否像「实施例N / 合成例N / iii-N / OXL-* / 纯序号」。"""
     t = normalize_spaces(text)
     if not t:
         return False
     return bool(_INDEPENDENT_LABEL_RE.fullmatch(t))
+
+
+# 左列命名行标签：分散液101 / 样品3（列头「分散液名」以「名」结尾，排除）
+_NAMED_ROW_LABEL_RE = re.compile(
+    r"^[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]{2,12}\d{1,4}$"
+)
+_HEADER_NAME_SUFFIX_RE = re.compile(r"名$")
+_BODY_DATA_CODE_RE = re.compile(r"^[A-Za-z][-－]?[A-Za-z0-9][-－\w]*$")
+
+
+def is_named_row_label(text: str) -> bool:
+    """左列「CJK+序号」行名（分散液101），非列头「分散液名」。"""
+    t = normalize_spaces(text)
+    if not t or _HEADER_NAME_SUFFIX_RE.search(t):
+        return False
+    return bool(_NAMED_ROW_LABEL_RE.match(t))
+
+
+def looks_like_body_data_token(text: str) -> bool:
+    """表体单元格常见数据：数字、缺测符、配方代号（A-p-101）。"""
+    t = normalize_spaces(text)
+    if not t:
+        return False
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", t):
+        return True
+    if t in {"-", "—", "一", "0"}:
+        return True
+    return bool(_BODY_DATA_CODE_RE.match(t))
 
 
 def are_independent_row_labels(texts: Sequence[str]) -> bool:

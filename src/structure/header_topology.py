@@ -20,6 +20,9 @@ from .hline_repair import (
     _header_origin_at,
     _is_fragment_text,
     _is_header_shard,
+    _is_numeric_subcol_label,
+    _labels_in_row_range,
+    _nested_header_parent_sub_rows,
     repair_parent_header_shard_colspans,
 )
 from .tsr_refine import (
@@ -323,8 +326,15 @@ _LETTERED_CATEGORY_PARENT_RE = re.compile(
     r"^([（(][A-Za-z][)）](-\d+)?|"
     r".{0,12}(聚合物|引发剂).{0,4}[（(][A-Za-z][)）])$"
 )
-_LEAF_KIND_RE = re.compile(r"^(种类|类型|名称|组分|品种)$")
+_LEAF_KIND_RE = re.compile(r"^(种类|種類|类型|類型|名称|名稱|组分|組分|品种|品種)$")
 _LEAF_AMOUNT_RE = re.compile(r"^(配混量|量|添加量|含量|用量|分子量)")
+_NUMERIC_METRIC_LEAF_RE = re.compile(r"^\d{2,5}$")
+
+
+def _looks_like_numeric_metric_leaf(text: str) -> bool:
+    """底行纯数字列头（200/300/… 或曝光宽容度刻度）。"""
+    t = _compact(text)
+    return bool(t) and bool(_NUMERIC_METRIC_LEAF_RE.match(t))
 
 
 def _looks_like_lettered_category_parent(text: str) -> bool:
@@ -505,6 +515,13 @@ def reanchor_lettered_parents_from_ocr(
             or tc.startswith("配混量")
             or tc.startswith("分子量")
         )
+        if _looks_like_numeric_metric_leaf(t):
+            if cur:
+                groups.append(cur)
+                cur = []
+                cur_has_amount = False
+            groups.append([col])
+            continue
         if is_kind:
             if cur:
                 groups.append(cur)
@@ -709,11 +726,17 @@ def expand_lettered_category_parents(
                 break
             # 底行若是「聚合物(A)分子量」一类夹带父头的叶子，禁止继续吞
             leaf_under = _leaf_text_at_col(work, leaf_row, nxt, text_boxes)
+            if leaf_under and _looks_like_numeric_metric_leaf(leaf_under):
+                break
             if leaf_under and not _looks_like_kind_or_amount_leaf(leaf_under):
                 if _looks_like_lettered_category_parent(
                     leaf_under
                 ) or "聚合物" in _compact(leaf_under):
                     break
+            # 已完成一组 種類|添加量，下一列不是本组叶子 → 停止（避免吞掉数字区段）
+            pair_leaves = [c for c in leaf_cols if new_cs <= c <= new_ce]
+            if nxt not in leaf_cols and len(pair_leaves) >= 2:
+                break
             new_ce = nxt
             leaves_here = [c for c in leaf_cols if new_cs <= c <= new_ce]
             # 已盖住 ≥2 叶子且当前列是叶子 → 停（一组 种类|量 结束）
@@ -799,6 +822,219 @@ def expand_lettered_category_parents(
     return cells
 
 
+def drop_intr_span_header_shards(
+    cells: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """删除 lettered 父头 colspan 内、非起点列上的 OCR 泄漏单列格（如 カル光重合）。"""
+    if not cells:
+        return cells
+    row_seps, _ = _derive_seps(cells)
+    if len(row_seps) < 2:
+        return cells
+    body_row = _first_body_row_index(cells, [], row_seps)
+    header_end = max(0, body_row - 1)
+    dropped = 0
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        rs, re = int(c["row_start"]), int(c["row_end"])
+        cs, ce = int(c["col_start"]), int(c["col_end"])
+        if rs > header_end or rs != re or cs != ce:
+            out.append(c)
+            continue
+        shard = False
+        for pc in cells:
+            if pc is c:
+                continue
+            prs, pre = int(pc["row_start"]), int(pc["row_end"])
+            if prs > rs or pre < rs:
+                continue
+            pcs, pce = int(pc["col_start"]), int(pc["col_end"])
+            if pce <= pcs or cs < pcs or cs > pce:
+                continue
+            if not _looks_like_lettered_category_parent(str(pc.get("text") or "")):
+                continue
+            if cs == pcs:
+                break
+            shard = True
+            break
+        if shard:
+            dropped += 1
+            logger.info(
+                "drop_intr_span_shard: r%d c%d %r",
+                rs,
+                cs,
+                str(c.get("text") or "")[:20],
+            )
+            continue
+        out.append(c)
+    if dropped:
+        logger.info("drop_intr_span_header_shards: %d 处", dropped)
+        return out
+    return cells
+
+
+def logic_body_start_row(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> int:
+    """表体起始逻辑行：有 OCR 时用行标签/数值带信号，否则回退 _body_header_bounds。"""
+    from .hline_repair import _first_body_row_index
+    from .tsr_refine import _body_header_bounds, _derive_seps
+
+    if text_boxes:
+        row_seps, _col_seps = _derive_seps(cells)
+        if len(row_seps) >= 3:
+            return int(_first_body_row_index(cells, text_boxes, row_seps))
+    _he, body_start, _body_h = _body_header_bounds(cells)
+    return body_start
+
+
+def needs_lettered_header_escalation(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Sequence[Dict[str, Any]],
+) -> bool:
+    """轻量 TSR 表头碎成大量空 1×1 格，但 OCR 已检出 (A)~(J) 分类父头 → 应升级融合。
+
+    几何信号：字母分类 OCR 框 ≥3，表头带空单元格过多且父头格过少。
+    非 P67 专用——凡「成分列 (A)(B)… + 種類/重量部」双层表头均适用。
+    """
+    from .hline_repair import _looks_like_lettered_category_header
+
+    if not cells or not text_boxes:
+        return False
+    lettered_ocr = sum(
+        1
+        for tb in text_boxes
+        if _looks_like_lettered_category_header(str(tb.get("text") or ""))
+    )
+    if lettered_ocr < 1:
+        return False
+    body_start = logic_body_start_row(cells, text_boxes)
+    top_row = min(int(c["row_start"]) for c in cells)
+    scan_end = body_start if body_start >= 2 else min(
+        top_row + 8, max(int(c["row_end"]) for c in cells) + 1
+    )
+    header = [c for c in cells if int(c["row_end"]) < scan_end]
+    if len(header) < 2:
+        return False
+    empty_unit = 0
+    lettered_cells = 0
+    max_top_colspan = 1
+    ghost_header_rows = 0
+    for r in range(top_row + 1, scan_end):
+        row_cells = [c for c in cells if int(c["row_start"]) <= r <= int(c["row_end"])]
+        if not row_cells:
+            continue
+        if all(
+            not str(c.get("text") or "").strip()
+            and int(c.get("row_span") or 1) == 1
+            and int(c.get("col_span") or 1) == 1
+            for c in row_cells
+        ):
+            ghost_header_rows += 1
+    for c in header:
+        t = str(c.get("text") or "").strip()
+        rs = int(c.get("row_span") or (int(c["row_end"]) - int(c["row_start"]) + 1))
+        cs = int(c.get("col_span") or (int(c["col_end"]) - int(c["col_start"]) + 1))
+        if not t and rs == 1 and cs == 1:
+            empty_unit += 1
+        if _looks_like_lettered_category_header(t):
+            lettered_cells += 1
+        if int(c["row_start"]) == top_row:
+            max_top_colspan = max(max_top_colspan, cs)
+    # 信号 A：表头碎成大量空 1×1，OCR 父头未落入拓扑
+    if empty_unit >= 4 and lettered_cells < max(lettered_ocr, 2):
+        return True
+    # 信号 B：顶行超宽合并，但 OCR 检出多个 (A)(B)… 父头（典型成分表）
+    if lettered_ocr >= 2 and max_top_colspan >= 8 and lettered_cells < lettered_ocr:
+        return True
+    # 信号 C：顶行有字母父头 + 下方多行全空幽灵行（轻量 TSR 典型碎表头）
+    if (
+        lettered_ocr >= 1
+        and max_top_colspan >= 12
+        and ghost_header_rows >= 2
+        and lettered_cells <= lettered_ocr
+    ):
+        return True
+    # 信号 D：OCR 已检出多个 (A)(B)… 父头，但拓扑表头区无一落入（轻量 TSR 典型）
+    if lettered_ocr >= 2 and lettered_cells == 0:
+        return True
+    return False
+
+
+def expand_parent_over_numeric_band(
+    cells: List[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """数字子列带上方父格扩 colspan（Example 1..17 等，语言无关）。"""
+    text_boxes = list(text_boxes or [])
+    if not cells:
+        return cells
+    row_seps, col_seps = _derive_seps(cells)
+    if len(row_seps) < 3 or len(col_seps) < 3:
+        return cells
+
+    parent_row, sub_row = _nested_header_parent_sub_rows(cells, text_boxes, row_seps)
+    if sub_row <= parent_row:
+        return cells
+
+    max_col = max(int(c["col_end"]) for c in cells)
+    changed = 0
+    col = 0
+    while col <= max_col:
+        band: List[int] = []
+        scan = col
+        while scan <= max_col:
+            label = _labels_in_row_range(cells, sub_row, scan, scan, text_boxes)[0]
+            if _is_numeric_subcol_label(label):
+                band.append(scan)
+                scan += 1
+            elif band:
+                break
+            else:
+                scan += 1
+        if len(band) < 3:
+            col = scan + 1 if scan > col else col + 1
+            continue
+
+        cs_band, ce_band = band[0], band[-1]
+        parent = _header_origin_at(cells, parent_row, cs_band)
+        if parent is None:
+            parent = _cell_covering_row_col(cells, parent_row, cs_band)
+        if parent is None:
+            col = ce_band + 1
+            continue
+
+        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
+        new_cs = min(pcs, cs_band)
+        new_ce = max(pce, ce_band)
+        if new_cs == pcs and new_ce == pce:
+            col = ce_band + 1
+            continue
+
+        x1 = float(col_seps[new_cs])
+        x2 = float(col_seps[new_ce + 1])
+        y1 = float(row_seps[int(parent["row_start"])])
+        y2 = float(row_seps[int(parent["row_end"]) + 1])
+        parent["col_start"] = new_cs
+        parent["col_end"] = new_ce
+        _refresh_spans(parent)
+        parent["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
+        changed += 1
+        logger.info(
+            "numeric_band_parent: r%d c%d-%d → colspan %d",
+            parent_row,
+            new_cs,
+            new_ce,
+            new_ce - new_cs + 1,
+        )
+        col = ce_band + 1
+
+    if changed:
+        logger.info("expand_parent_over_numeric_band: %d 处", changed)
+    return cells
+
+
 def repair_parent_header_topology(
     cells: List[Dict[str, Any]],
     text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
@@ -807,7 +1043,9 @@ def repair_parent_header_topology(
     text_boxes = list(text_boxes or [])
     work = repair_parent_header_shard_colspans(cells, text_boxes)
     work = reclaim_leaked_header_fragments(work)
+    work = drop_intr_span_header_shards(work)
     work = reanchor_lettered_parents_from_ocr(work, text_boxes)
     work = expand_group_parent_over_empty_slots(work, text_boxes)
     work = expand_lettered_category_parents(work, text_boxes)
+    work = expand_parent_over_numeric_band(work, text_boxes)
     return work

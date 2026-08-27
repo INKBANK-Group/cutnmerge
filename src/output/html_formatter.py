@@ -298,6 +298,46 @@ def _composition_header_merge_forbidden(a: str, b: str) -> bool:
     return (a_comp and b_pig) or (b_comp and a_pig)
 
 
+def _tiered_column_header_merge_forbidden(a: str, b: str) -> bool:
+    """表头带内不同父列/区段标签禁止因逻辑重叠拼进同一格。"""
+    from ..structure.header_topology import (
+        _looks_like_kind_or_amount_leaf,
+        _looks_like_lettered_category_parent,
+    )
+
+    ca = "".join((a or "").split())
+    cb = "".join((b or "").split())
+    if not ca or not cb:
+        return False
+    if _looks_like_kind_or_amount_leaf(a) and _looks_like_independent_header_label(b):
+        return True
+    if _looks_like_kind_or_amount_leaf(b) and _looks_like_independent_header_label(a):
+        return True
+    if _looks_like_kind_or_amount_leaf(a) or _looks_like_kind_or_amount_leaf(b):
+        return False
+    la = _lettered_parent_letter(a)
+    lb = _lettered_parent_letter(b)
+    if la and lb and la.upper() != lb.upper():
+        return True
+    if _looks_like_lettered_category_parent(a) and _looks_like_lettered_category_parent(b):
+        return ca != cb
+    if _looks_like_lettered_category_parent(a) ^ _looks_like_lettered_category_parent(b):
+        if len(ca) >= 4 and len(cb) >= 4 and not _is_cell_frag(a) and not _is_cell_frag(b):
+            return True
+    if (
+        not la
+        and not lb
+        and len(ca) >= 3
+        and len(cb) >= 3
+        and not _is_cell_frag(a)
+        and not _is_cell_frag(b)
+        and _looks_like_independent_header_label(a)
+        and _looks_like_independent_header_label(b)
+    ):
+        return True
+    return False
+
+
 def _clip_monomer_parent_row_overlap(
     cell: Dict[str, Any],
     unique_owners: List[Dict[str, Any]],
@@ -412,24 +452,44 @@ def _clip_row_header_logic_overlap(
     return False
 
 
-def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _resolve_logic_overlaps(
+    cells: List[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """
     渲染前消解逻辑矩形重叠：后到的非空文本并入占位格，并裁掉冲突覆盖。
 
     空/碎片占位者遇到更大有字格时被赶走，避免大格剩余 L 形空位渲染成幽灵线。
+
+    表头带不参与：多级表头父子格在逻辑格上重叠，拼字/裁切会破坏 (A)~(J) 拓扑。
     """
     if not cells:
         return cells
 
-    # 按面积升序：先处理小格（更具体）
-    ordered = sorted(cells, key=lambda c: (
+    from ..structure.header_topology import logic_body_start_row
+
+    body_start = logic_body_start_row(cells, text_boxes)
+    header_cells = [c for c in cells if int(c["row_start"]) < body_start]
+    body_cells = [c for c in cells if int(c["row_start"]) >= body_start]
+
+    out: List[Dict[str, Any]] = [dict(c) for c in header_cells]
+    occupancy: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for cell in out:
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        cs, ce = int(cell["col_start"]), int(cell["col_end"])
+        for r in range(rs, re + 1):
+            for c in range(cs, ce + 1):
+                occupancy[(r, c)] = cell
+
+    if not body_cells:
+        return out
+
+    # 按面积升序：先处理小格（更具体）——仅表体
+    ordered = sorted(body_cells, key=lambda c: (
         _logic_area(c),
         int(c["row_start"]),
         int(c["col_start"]),
     ))
-
-    occupancy: Dict[Tuple[int, int], Dict[str, Any]] = {}
-    out: List[Dict[str, Any]] = []
 
     for cell in ordered:
         rs, re = int(cell["row_start"]), int(cell["row_end"])
@@ -533,6 +593,11 @@ def _resolve_logic_overlaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 continue
             if _composition_header_merge_forbidden(prev, text):
                 # 「组成[质量份]」落入「颜料分散液」等左格时禁止拼字，保留双方
+                _try_place_rect_remainder(
+                    cell, free_positions, occupancy, out, clear_text=False
+                )
+                continue
+            if _tiered_column_header_merge_forbidden(prev, text):
                 _try_place_rect_remainder(
                     cell, free_positions, occupancy, out, clear_text=False
                 )
@@ -1516,7 +1581,7 @@ def _merge_leading_label_gaps(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
 
 
 _KNOWN_LEAF_SUBHEADER_RE = re.compile(
-    r"^(种类|类型|名称|组分|品种|项目|序号|牌号|"
+    r"^(种类|種類|类型|類型|名称|名稱|组分|組分|品种|品種|项目|序号|牌号|"
     r"量|添加量|含量|用量|摩尔|质量|份数)"
     r"(?:[\(（].*)?$"
 )
@@ -1556,7 +1621,7 @@ def _is_leaf_type_amount_subheader(text: str) -> bool:
     if not lines:
         return False
     joined = "".join("".join(ln.split()) for ln in lines)
-    if not re.search(r"(种类|类型|名称|量|含量|用量|添加量)", joined):
+    if not re.search(r"(种类|種類|类型|類型|名称|名稱|量|含量|用量|添加量)", joined):
         return False
     for ln in lines:
         compact = "".join(ln.split())
@@ -1647,6 +1712,7 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
         return cells
 
     max_col = max(int(c["col_end"]) for c in cells)
+    header_end = _effective_header_end(cells)
     dropped: Set[int] = set()
 
     # 先统计每列被哪些 cell 覆盖，以及这些 cell 是否带文本/跨列
@@ -1663,6 +1729,14 @@ def drop_evidenceless_columns(cells: List[Dict[str, Any]], *, narrow_ratio: floa
         any_text = any(texts)
         # 整列多为行序号（如 16–30）：窄但仍是真实列，保留
         if is_index_column(texts):
+            continue
+        # 表头锚点列：有非空标签即保留（含 m/X/s/t 等短化学符号列头）
+        if any(
+            int(c["col_start"]) == col
+            and int(c["row_start"]) <= header_end
+            and str(c.get("text") or "").strip()
+            for c in covered_cells
+        ):
             continue
         # colspan 原点列：格子从这里起步且有实质文本，不能当幽灵列删
         if any(
@@ -3598,6 +3672,14 @@ def _drop_body_empty_columns(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]
             cells, col, header_end
         ):
             continue
+        # 表头锚点列（含短化学符号列头）：表体可全为同格符，仍保留
+        if any(
+            int(c["col_start"]) == col
+            and int(c["row_start"]) <= header_end
+            and str(c.get("text") or "").strip()
+            for c in covered
+        ) and not _colspan_sibling_has_body_data(cells, col, header_end):
+            continue
         # 表头带起点有实质标签 → 保留；但若同 colspan 带内另有列承担表体数据，则本列是幽灵列
         header_anchor = any(
             int(c["col_start"]) == col
@@ -4096,9 +4178,22 @@ def _top_header_band_end(cells: List[Dict[str, Any]]) -> int:
         header_end = cap if header_end < 0 else min(header_end, cap)
     if header_end < 0:
         header_end = 0
-    return _extend_header_end_for_unit_rows(
+    header_end = _extend_header_end_for_unit_rows(
         cells, header_end, cap_row=first_body_stub
     )
+    # 左列命名行标签（分散液101）定表体起点，勿让 rowspan 把表头带扩进首行数据
+    try:
+        from ..structure.hline_repair import _first_body_row_index
+        from ..structure.tsr_refine import _derive_seps
+
+        row_seps, _ = _derive_seps(cells)
+        if len(row_seps) >= 2:
+            body_row = _first_body_row_index(cells, [], row_seps)
+            if body_row >= 1:
+                header_end = min(header_end, body_row - 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return header_end
 
 
 def _header_cell_above(
@@ -4639,9 +4734,27 @@ def _normalize_tiered_column_headers(
         text = str(c.get("text") or "").strip()
         if not text or _is_cell_frag(text) or _is_header_unit_line(text):
             continue
+        from ..structure.header_topology import (
+            _looks_like_kind_or_amount_leaf,
+            _looks_like_numeric_metric_leaf,
+        )
+
+        if (
+            _is_known_leaf_subheader(text)
+            or _looks_like_kind_or_amount_leaf(text)
+            or _looks_like_numeric_metric_leaf(text)
+        ):
+            continue
         if _EXAMPLE_COL_HEADER_RE.search(text):
             continue
         if int(c.get("col_span") or 1) > 1:
+            continue
+        # 顶行已有 colspan/rowspan 父头覆盖本列 → 底行叶子保持单行
+        top_cover = _row_col_header_label(cells, top_row, cs)
+        if top_cover and (
+            _lettered_parent_letter(top_cover)
+            or _looks_like_independent_header_label(top_cover)
+        ):
             continue
         top_label = _row_col_header_label(cells, top_row, cs)
         if (
@@ -5348,6 +5461,13 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
         # colspan 父头：仅当中间行在本列范围内完全无非空格时，才向下扩 rowspan
         # （通式…化合物 下空洞）；若范围内已有 (A)/(B) 等子头则不得吞掉。
         if is_colspan_parent:
+            from ..structure.header_topology import _looks_like_lettered_category_parent
+
+            if _lettered_parent_letter(upper_text) or _looks_like_lettered_category_parent(
+                upper_text
+            ):
+                out.append(upper)
+                continue
             def _any_nonempty_overlap(next_row: int, cs: int, ce: int) -> bool:
                 for c in cells:
                     if id(c) in dropped_ids or c is upper:
@@ -5406,7 +5526,34 @@ def _merge_header_empty_below(cells: List[Dict[str, Any]]) -> List[Dict[str, Any
 
         lower_text = str(lower.get("text") or "").strip()
 
+        from ..utils.label_patterns import is_named_row_label
+
+        if is_named_row_label(lower_text):
+            out.append(upper)
+            continue
+
         if not _is_frag_or_empty(lower_text):
+            from ..structure.header_topology import (
+                _looks_like_kind_or_amount_leaf,
+                _looks_like_numeric_metric_leaf,
+            )
+            from ..utils.label_patterns import looks_like_body_data_token
+
+            if _looks_like_kind_or_amount_leaf(upper_text) and looks_like_body_data_token(
+                lower_text
+            ):
+                out.append(upper)
+                continue
+
+            if _is_known_leaf_subheader(lower_text) or _looks_like_kind_or_amount_leaf(
+                lower_text
+            ):
+                if not _lettered_parent_letter(upper_text):
+                    out.append(upper)
+                    continue
+            if _looks_like_numeric_metric_leaf(lower_text):
+                out.append(upper)
+                continue
             if (
                 _is_stacked_header_label(upper_text)
                 and _is_stacked_header_label(lower_text)
@@ -5504,6 +5651,7 @@ def cells_to_html_table(
     cells: List[Dict[str, Any]],
     *,
     compress_empty: bool = True,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     """
     将带逻辑拓扑的单元格列表渲染为单个 <table>。
@@ -5515,7 +5663,13 @@ def cells_to_html_table(
 
     work = [dict(c) for c in cells]
     work = _split_example_header_rowspans(work)
-    work = _resolve_logic_overlaps(work)
+    from ..structure.header_topology import repair_parent_header_topology as _topo_pre
+    from ..structure.tsr_refine import resolve_logic_grid_conflicts
+
+    # 先按子表头列组恢复父头 colspan，再消解重叠，避免 (A)(B)(C) 等被拼成宽格
+    work = _topo_pre(work, list(text_boxes or []))
+    work = resolve_logic_grid_conflicts(work, text_boxes)
+    work = _resolve_logic_overlaps(work, text_boxes)
     # 先丢掉全空幽灵行（P24 顶上空行），再算表头带 / 拆身列 colspan
     work = _drop_fully_empty_rows(work)
     work = _drop_leading_header_only_columns(work)
@@ -5529,7 +5683,7 @@ def cells_to_html_table(
     work = _align_orphan_left_anchor_headers(work)
     from ..structure.header_topology import repair_parent_header_topology
 
-    work = repair_parent_header_topology(work, [])
+    work = repair_parent_header_topology(work, list(text_boxes or []))
     work = _drop_body_empty_columns(work)
     work = _merge_leading_empty_into_label(work)
     work = _merge_split_body_side_labels(work)
@@ -5550,7 +5704,7 @@ def cells_to_html_table(
     work = _normalize_tiered_column_headers(work)
     from ..structure.header_topology import repair_parent_header_topology as _topo_late
 
-    work = _topo_late(work, [])
+    work = _topo_late(work, list(text_boxes or []))
     work = _merge_formula_parent_colspans(work)
     work = _ensure_composition_parent_header(work)
     work = _extend_composition_parent_colspan(work)
@@ -5668,6 +5822,7 @@ def cells_to_html(
     split_subtables: bool = True,
     compress_empty: bool = True,
     lift_captions: bool = True,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     """多子表切分后各自生成 HTML，表题提升为段落。"""
     if split_subtables:
@@ -5685,7 +5840,9 @@ def cells_to_html(
             if caption:
                 parts.append(f"<p>{html.escape(caption)}</p>")
             continue
-        table_html = cells_to_html_table(work, compress_empty=compress_empty)
+        table_html = cells_to_html_table(
+            work, compress_empty=compress_empty, text_boxes=text_boxes
+        )
         if not table_html:
             if caption:
                 parts.append(f"<p>{html.escape(caption)}</p>")
@@ -5717,6 +5874,7 @@ def build_html_output(
     *,
     split_subtables: bool = True,
     compress_empty: bool = True,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     """游离文本前缀 + HTML 表格。结构失败时只输出游离文本块。"""
     prefix = format_free_texts(free_texts)
@@ -5736,6 +5894,7 @@ def build_html_output(
         cells,
         split_subtables=split_subtables,
         compress_empty=compress_empty,
+        text_boxes=text_boxes,
     )
     if prefix_keys:
         table = _drop_duplicate_caption_paragraphs(table, prefix_keys)
@@ -5896,8 +6055,10 @@ def html_structure_health(html_text: str) -> float:
     if ex_all == 0 and garbage >= 3:
         score -= 20.0
     elif ex_all == 0 and n_rows >= 8 and not _NORMAL_TABLE_HEADER_RE.search(table):
-        # 大表却完全不见专利表头词 → 方向错误的强负分
-        score -= 12.0
+        if n_cols > n_rows * 2.0:
+            score -= 12.0
+    if n_rows >= 12 and n_cols >= 5 and n_rows > n_cols * 1.15:
+        score += 10.0
     return score
 
 
@@ -5923,11 +6084,6 @@ def html_output_looks_broken(html_text: str) -> bool:
     free_paras = re.findall(r"<p>([^<]{1,12})</p>", html_text)
     if len(free_paras) >= 8 and sum(1 for p in free_paras if re.fullmatch(r"[A-Za-z0-9+＋.]+|100|A\+?", p)) >= 6:
         return True
-    # 游离短中文垃圾段 + 表内缺少常见表头词（横置 OCR 乱码）
-    if len(free_paras) >= 5:
-        blob = re.sub(r"\s+", "", html_text)
-        if not re.search(r"(组合物|组成\[|聚合物|单体\s*[\[［]|实施例|合成例)", blob):
-            return True
     first_table = re.search(r"<table[^>]*>(.*?)</table>", html_text, re.DOTALL)
     if not first_table:
         return False
@@ -5937,12 +6093,23 @@ def html_output_looks_broken(html_text: str) -> bool:
     n_cols = max((len(r) for r in rows), default=0)
     body_labels = _count_body_example_row_labels(rows)
 
+    # 游离短段：仅当行列比也异常时才判坏（避免英文表 caption 误杀）
+    if len(free_paras) >= 5:
+        blob = re.sub(r"\s+", "", html_text)
+        if not re.search(r"(组合物|组成\[|聚合物|单体\s*[\[［]|实施例|合成例)", blob):
+            if n_rows < 8 or n_cols > n_rows * 1.8:
+                return True
+
     # 直立实验表：表体首列一串实施例/比较例 → 健康，勿因「表内实施例多」误杀
     if body_labels >= 5 and empty_tr < 5:
         return False
 
     # 直立配方矩阵：实施例作列头 + 侧栏成分纵排 → 健康（勿当侧躺）
     if _looks_like_composition_matrix(rows) and empty_tr < 5:
+        return False
+
+    # 直立宽表（语言无关）：行数≥列数且足够大 → 健康
+    if n_rows >= 10 and n_cols >= 4 and n_rows >= n_cols and empty_tr < 5:
         return False
 
     chunk = table[:2500]
@@ -5956,6 +6123,16 @@ def html_output_looks_broken(html_text: str) -> bool:
         and not has_normal_header
         and len(_SIDEWAYS_OCR_GARBAGE_RE.findall(table)) >= 3
         and n_rows >= 8
+    ):
+        return True
+
+    # 误转 90° 结构侧躺（语言无关）：列数远大于行数
+    if (
+        n_rows >= 3
+        and n_cols >= 10
+        and n_cols > n_rows * 2.3
+        and body_labels <= 1
+        and empty_tr >= 1
     ):
         return True
 

@@ -72,6 +72,9 @@ from ..structure.tsr_refine import (
     merge_ghost_columns,
     merge_ghost_rows,
     merge_complementary_ditto_columns,
+    merge_complementary_decimal_columns,
+    merge_decimal_fragment_columns_from_cells,
+    repeat_merge_decimal_fragment_columns,
     merge_stacked_chem_amount_cells,
     normalize_oversegmented_table_rows,
     reconstruct_header_cells,
@@ -90,11 +93,19 @@ from ..structure.tsr_refine import (
     sanitize_side_header_texts,
     split_left_anchor_subheader_leak,
     split_undersplit_monomer_child_headers,
+    split_bad_colspans,
     split_underspanned_rows,
+    split_stacked_row_label_rowspans,
+    split_multiline_rowspan_cells,
+    align_full_rowspans_to_subgrid,
+    split_false_isolated_body_rowspans,
+    repair_body_row_topology,
     needs_monomer_header_reconstruct,
     structure_quality_score,
+    resolve_logic_grid_conflicts,
     _expand_monomer_over_child_headers,
 )
+from ..structure.header_topology import needs_lettered_header_escalation
 
 logger = logging.getLogger(__name__)
 DEFAULT_DEBUG_DIR = ROOT / "data" / "debug"
@@ -137,20 +148,29 @@ _LIGHT_ESCALATE_CONFLICT_RATIO = 0.02
 
 
 def _light_has_monomer_subheaders(cells: List[Dict[str, Any]]) -> bool:
-    """轻量结果已有「单体」父格 + 下一行列向子表头 → 勿为微小冲突升级毁掉表头。"""
+    """轻量结果已有「单体/聚合物」父格 + 下一行列向子表头 → 勿为微小冲突升级毁掉表头。
+
+    仅当父格文本明确含单体/聚合物时才阻断升级；勿用 col_start/span 魔法数猜无字左锚。
+    (A)~(J) 成分列头由 hline_repair 同义判定排除。
+    """
+    from ..structure.hline_repair import _looks_like_lettered_category_header
+
     if not cells:
         return False
     monomer_re = re.compile(r"单体\s*[\[［]")
+    polymer_re = re.compile(r"聚合物")
+
     for parent in cells:
-        if not monomer_re.search(str(parent.get("text") or "")):
-            # 归属前无字：用宽格 + 下一行列数判断
-            span = int(parent.get("col_span") or 1)
-            if span < 3:
-                continue
-        else:
-            span = int(parent.get("col_span") or 1)
-            if span < 2:
-                continue
+        text = str(parent.get("text") or "")
+        if _looks_like_lettered_category_header(text):
+            continue
+        has_monomer = bool(monomer_re.search(text))
+        has_polymer = bool(polymer_re.search(text))
+        if not has_monomer and not has_polymer:
+            continue
+        span = int(parent.get("col_span") or 1)
+        if span < 2:
+            continue
         pcs, pce = int(parent["col_start"]), int(parent["col_end"])
         pre = int(parent["row_end"])
         kids = [
@@ -161,7 +181,6 @@ def _light_has_monomer_subheaders(cells: List[Dict[str, Any]]) -> bool:
             and int(c["col_start"]) <= pce
             and int(c.get("col_span") or 1) >= 1
         ]
-        # 子表头行应切成 ≥2 格，且覆盖父带大半列
         if len(kids) < 2:
             continue
         covered = set()
@@ -170,25 +189,6 @@ def _light_has_monomer_subheaders(cells: List[Dict[str, Any]]) -> bool:
                 if pcs <= col <= pce:
                     covered.add(col)
         if len(covered) >= max(2, int(0.5 * (pce - pcs + 1) + 0.5)):
-            return True
-    # 无字宽格：仅靠拓扑（P97 归属前）
-    for parent in cells:
-        span = int(
-            parent.get("col_span")
-            or (int(parent["col_end"]) - int(parent["col_start"]) + 1)
-        )
-        if span < 3:
-            continue
-        pcs, pce = int(parent["col_start"]), int(parent["col_end"])
-        pre = int(parent["row_end"])
-        kids = [
-            c
-            for c in cells
-            if int(c["row_start"]) == pre + 1
-            and int(c["col_end"]) >= pcs
-            and int(c["col_start"]) <= pce
-        ]
-        if len(kids) >= 2:
             return True
     return False
 
@@ -300,13 +300,19 @@ def _render_outputs(
     free_texts: list,
     *,
     compress_empty_cols: bool,
+    text_boxes: Optional[list] = None,
 ) -> Dict[str, str]:
     """生成 HTML；Markdown 在 pipeline 末尾由 html2md 统一转换。"""
+    from ..structure.hline_repair import collapse_body_data_sliver_rows
+
+    cells = resolve_logic_grid_conflicts(list(cells), text_boxes)
+    cells = collapse_body_data_sliver_rows(cells, text_boxes)
     html = build_html_output(
         cells,
         free_texts,
         split_subtables=True,
         compress_empty=compress_empty_cols,
+        text_boxes=text_boxes,
     )
     return {"html": html or "", "md": ""}
 
@@ -333,6 +339,8 @@ def _extract_via_lines(
 
     binary = binarize_otsu(image)
     tables = [refine_table(t, text_boxes) for t in tables]
+    for table in tables:
+        table.cells = repair_body_row_topology(table.cells, text_boxes, binary=binary)
 
     bboxes = [t.bbox for t in tables]
     html_parts: List[str] = []
@@ -382,7 +390,10 @@ def _extract_via_lines(
         remaining = still
 
         outs = _render_outputs(
-            cells, [], compress_empty_cols=compress_empty_cols
+            cells,
+            [],
+            compress_empty_cols=compress_empty_cols,
+            text_boxes=text_boxes,
         )
         if outs["html"]:
             html_parts.append(outs["html"])
@@ -465,7 +476,10 @@ def _extract_via_lore(
             max_cells=reocr_max_cells,
         )
     outs = _render_outputs(
-        cells, free_texts, compress_empty_cols=compress_empty_cols
+        cells,
+        free_texts,
+        compress_empty_cols=compress_empty_cols,
+        text_boxes=text_boxes,
     )
     return outs, [cells_to_debug_table(cells)]
 
@@ -503,44 +517,56 @@ def _extract_via_tsr(
                 image, confidence_thresh=0.0, text_boxes=text_boxes
             )
             if line_tables:
-                cells = fuse_tsr_with_lines(cells, line_tables)
+                cells = fuse_tsr_with_lines(cells, line_tables, text_boxes=text_boxes)
+                cells = repeat_merge_decimal_fragment_columns(cells, text_boxes)
         else:
             light_cells = refine_tsr_cells_light(cells)
             light_cells = merge_ghost_columns(light_cells, text_boxes)
+            # 幽灵列并入后，无竖线的双轨窄列（如 M^a|m）靠 OCR 双簇切分
+            light_cells = split_bad_colspans(light_cells, text_boxes)
             light_cells = merge_body_empty_columns(light_cells, text_boxes)
             light_cells = merge_complementary_ditto_columns(light_cells, text_boxes)
+            light_cells = repeat_merge_decimal_fragment_columns(light_cells, text_boxes)
             light_cells = merge_ghost_rows(light_cells, text_boxes)
             light_cells = dedupe_overlapping_cells(light_cells)
-            # 行欠切：窄高表 light 也需 OCR-y 切分（不依赖 aggressive）
-            if looks_row_undersegmented(light_cells, text_boxes):
-                logger.info("TSR-light 检测到行欠切，尝试 split_underspanned_rows")
-                light_cells = split_underspanned_rows(
-                    light_cells, text_boxes, min_support_cols=2
-                )
-                light_cells = dedupe_overlapping_cells(light_cells)
+            light_cells = repair_body_row_topology(
+                light_cells, text_boxes, min_support_cols=2
+            )
             light_cells = repair_monomer_parent_spans(light_cells, text_boxes)
             conflict_ratio = logic_conflict_ratio(light_cells)
             keep_light_headers = _light_has_monomer_subheaders(light_cells)
+            lettered_header_broken = needs_lettered_header_escalation(
+                light_cells, text_boxes
+            )
             if (
-                conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO
+                (
+                    conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO
+                    or lettered_header_broken
+                )
                 and not keep_light_headers
             ):
                 logger.info(
-                    "TSR-light 逻辑格重叠比例过高(%.3f)，自动升级 aggressive 融合",
+                    "TSR-light 逻辑格重叠比例过高(%.3f)%s，自动升级 aggressive 融合",
                     conflict_ratio,
+                    "；字母分类表头碎片化" if lettered_header_broken else "",
                 )
                 agg_cells = refine_tsr_cells(cells, text_boxes)
                 probe_lines = detect_tables(
                     image, confidence_thresh=0.0, text_boxes=text_boxes
                 )
                 fused = (
-                    fuse_tsr_with_lines(agg_cells, probe_lines)
+                    fuse_tsr_with_lines(agg_cells, probe_lines, text_boxes=text_boxes)
                     if probe_lines
                     else agg_cells
                 )
                 fused_ratio = logic_conflict_ratio(fused)
-                if fused_ratio < conflict_ratio:
+                if (
+                    lettered_header_broken
+                    or fused_ratio < conflict_ratio
+                    or conflict_ratio > _LIGHT_ESCALATE_CONFLICT_RATIO
+                ):
                     cells = fused
+                    cells = repeat_merge_decimal_fragment_columns(cells, text_boxes)
                     line_tables = probe_lines
                     escalated_from_light = True
                     logger.info(
@@ -580,9 +606,12 @@ def _extract_via_tsr(
     # 窄高表行欠切（与列数无关）
     row_under = bool(cells) and looks_row_undersegmented(cells, text_boxes)
     topo_bad = overseg or undermerge or shallow or row_under
+    # 覆盖率严重不足时自动框线回退（不依赖 --fallback-lines）：
+    # 大稀疏有线表上 lineless 常留下大量未覆盖 OCR，框线网格更完整。
+    critical_cov = bool(cells) and cov < 0.50 and len(text_boxes) >= 40
     need_lines_fallback = bool(
         (not cells or cov < 0.55 or too_few_cells) and fallback_lines
-    ) or topo_bad
+    ) or topo_bad or critical_cov
     if need_lines_fallback:
         n_cols, n_rows, n_cells = (
             cell_grid_stats(cells) if cells else (0, 0, 0)
@@ -620,6 +649,13 @@ def _extract_via_tsr(
                 n_cells,
                 len(text_boxes),
                 cov,
+            )
+        elif critical_cov:
+            logger.info(
+                "TSR 覆盖率过低(cov=%.3f cells=%d boxes=%d)，自动框线回退",
+                cov,
+                len(cells or []),
+                len(text_boxes),
             )
         else:
             logger.info(
@@ -828,6 +864,8 @@ def _extract_via_tsr(
 
     cells = repair_parent_header_topology(cells, text_boxes)
 
+    cells = repair_body_row_topology(cells, text_boxes, min_support_cols=2, binary=binary)
+
     from ..structure.transpose_fix import (
         maybe_fix_transposed_table,
         maybe_lines_fallback_after_transpose,
@@ -862,6 +900,23 @@ def _extract_via_tsr(
             len(cells),
         )
 
+    # 归属前几何修复：消解逻辑格冲突，切开欠切行与左列叠放实施例
+    cells = resolve_logic_grid_conflicts(cells)
+    cells = split_stacked_row_label_rowspans(cells, text_boxes)
+    cells = split_multiline_rowspan_cells(cells, text_boxes)
+    cells = align_full_rowspans_to_subgrid(cells, text_boxes)
+    cells = dedupe_overlapping_cells(cells)
+    if looks_row_undersegmented(cells, text_boxes):
+        before_n = len(cells)
+        cells = split_underspanned_rows(cells, text_boxes)
+        cells = dedupe_overlapping_cells(cells)
+        cells = resolve_logic_grid_conflicts(cells)
+        if len(cells) != before_n:
+            logger.info("归属前行欠切修复: cells %d→%d", before_n, len(cells))
+
+    cells = repeat_merge_decimal_fragment_columns(cells, text_boxes)
+    cells = dedupe_overlapping_cells(cells)
+
     table_bb = cells_union_bbox(cells)
     cells, free_texts = assign_texts_to_cells(
         cells,
@@ -873,16 +928,28 @@ def _extract_via_tsr(
         col_seps=col_seps,
         v_separators=v_separators,
     )
+    cells = merge_decimal_fragment_columns_from_cells(cells)
+    cells = dedupe_overlapping_cells(cells)
+    # 归属后可能仍有交错的小数尾列，再跑一轮 OCR 网格合并
+    cells = repeat_merge_decimal_fragment_columns(cells, text_boxes)
+    cells = dedupe_overlapping_cells(cells)
     # 归属可能把父表头 colspan 拆成短碎片；按子表头列宽重新合并 + 分组父头扩跨
     from ..structure.header_topology import repair_parent_header_topology as _topo_post
 
     cells = _topo_post(cells, text_boxes)
+    cells = repeat_merge_decimal_fragment_columns(cells, text_boxes)
+    cells = dedupe_overlapping_cells(cells)
     cells = merge_stacked_chem_amount_cells(cells)
     cells = _fix_dash_column_consistency(cells, binary=binary)
     cells = detect_dashes_in_empty_cells(cells, binary)
     cells = realign_pair_left_numeric_cells(cells)
     cells = infer_missing_sample_letters_in_empty_cells(cells)
     cells = peel_row_header_text(cells, text_boxes)
+    # 归属后左列叠放标签可能才写入 text，再拆一次 rowspan
+    cells = split_stacked_row_label_rowspans(cells, text_boxes)
+    cells = split_multiline_rowspan_cells(cells, text_boxes)
+    cells = align_full_rowspans_to_subgrid(cells, text_boxes)
+    cells = dedupe_overlapping_cells(cells)
     cells = extend_section_rowspan_over_metric_rows(cells)
     cells = repair_component_section_rowspans(cells)
     cells, caption_texts = strip_caption_cells(cells)
@@ -933,7 +1000,7 @@ def _extract_via_tsr(
             try:
                 agg_cells = refine_tsr_cells(cells, text_boxes)
                 probe_lines = detect_tables(image, confidence_thresh=0.0, text_boxes=text_boxes)
-                fused = fuse_tsr_with_lines(agg_cells, probe_lines) if probe_lines else agg_cells
+                fused = fuse_tsr_with_lines(agg_cells, probe_lines, text_boxes=text_boxes) if probe_lines else agg_cells
                 # 融合后结构无字，必须重新归属；否则会输出空壳表
                 fused_bb = cells_union_bbox(fused)
                 fused, _fused_free = assign_texts_to_cells(
@@ -978,9 +1045,15 @@ def _extract_via_tsr(
     cells = refill_short_side_headers_from_ocr(cells, text_boxes)
     cells = refill_truncated_monomer_child_headers_from_ocr(cells, text_boxes)
     cells = sanitize_side_header_texts(cells)
+    cells = merge_decimal_fragment_columns_from_cells(cells)
+    cells = repeat_merge_decimal_fragment_columns(cells, text_boxes)
+    cells = dedupe_overlapping_cells(cells)
     free_texts = filter_absorbed_free_texts(cells, free_texts)
     outs = _render_outputs(
-        cells, free_texts, compress_empty_cols=compress_empty_cols
+        cells,
+        free_texts,
+        compress_empty_cols=compress_empty_cols,
+        text_boxes=text_boxes,
     )
     return outs, [cells_to_debug_table(cells)]
 
@@ -1222,7 +1295,7 @@ def extract_table_output(
                 retry_angles.append(0)
         if can_retry_sideways:
             # OCR 已直立时强行试 90/270 极易把正常竖表拧成配方倾倒宽表
-            if looks_sideways(text_boxes):
+            if looks_sideways(text_boxes, image=image):
                 retry_angles.extend([90, 270])
             else:
                 logger.info(

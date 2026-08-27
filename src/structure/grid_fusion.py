@@ -8,7 +8,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .lines import DetectedTable, Separator
-from .tsr_refine import _derive_seps
+from .tsr_refine import (
+    _column_is_decimal_tail_col,
+    _derive_seps,
+    _is_double_line_seam,
+    _looks_like_ocr_fragment,
+    _robust_main_size,
+    _tb_bbox,
+)
 
 
 @dataclass
@@ -117,7 +124,82 @@ def _full_span_separators(seps: Sequence[float], total: float) -> List[Separator
     ]
 
 
-def _best_seps(tsr_cells: Sequence[Dict[str, Any]], table: DetectedTable) -> tuple[List[float], List[float], List[Separator], List[Separator]]:
+def _prune_micro_col_seps(
+    seps: Sequence[float],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+    *,
+    min_width_ratio: float = 0.38,
+) -> List[float]:
+    """剪掉双线缝与数字小数点假竖线造成的极窄列界。"""
+    if len(seps) < 3:
+        return [float(s) for s in seps]
+    seps = [float(s) for s in seps]
+
+    def _ghost_columns(cur: List[float]) -> List[bool]:
+        n_cols = len(cur) - 1
+        widths = [cur[i + 1] - cur[i] for i in range(n_cols)]
+        main_w = _robust_main_size(widths)
+        col_texts: List[List[str]] = [[] for _ in range(n_cols)]
+        if text_boxes:
+            for tb in text_boxes:
+                x1, y1, x2, y2 = _tb_bbox(tb)
+                mx = (x1 + x2) / 2.0
+                t = str(tb.get("text") or "").strip()
+                if not t:
+                    continue
+                for c in range(n_cols):
+                    if cur[c] <= mx < cur[c + 1] or (
+                        c == n_cols - 1 and cur[c] <= mx <= cur[c + 1]
+                    ):
+                        col_texts[c].append(t)
+                        break
+        ghost = [False] * n_cols
+        for c in range(n_cols):
+            w = widths[c]
+            if _is_double_line_seam(w, main_w):
+                ghost[c] = True
+                continue
+            if w >= min_width_ratio * main_w:
+                ghost[c] = False
+                continue
+            if text_boxes and _column_is_decimal_tail_col(col_texts[c], min_hits=1):
+                ghost[c] = True
+                continue
+            if text_boxes and col_texts[c]:
+                only_frag = all(_looks_like_ocr_fragment(t) for t in col_texts[c])
+                ghost[c] = only_frag
+                continue
+            ghost[c] = w < 0.22 * main_w
+        return ghost
+
+    changed = True
+    while changed and len(seps) >= 3:
+        changed = False
+        ghost = _ghost_columns(seps)
+        if not any(ghost):
+            break
+        c = ghost.index(True)
+        if c == 0:
+            seps.pop(1)
+        elif c == len(seps) - 2:
+            seps.pop(-2)
+        else:
+            widths = [seps[i + 1] - seps[i] for i in range(len(seps) - 1)]
+            left_w = widths[c - 1]
+            right_w = widths[c + 1] if c + 1 < len(widths) else 0.0
+            if left_w >= right_w:
+                seps.pop(c)
+            else:
+                seps.pop(c + 1)
+        changed = True
+    return seps
+
+
+def _best_seps(
+    tsr_cells: Sequence[Dict[str, Any]],
+    table: DetectedTable,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> tuple[List[float], List[float], List[Separator], List[Separator]]:
     tsr_row_seps, tsr_col_seps = _derive_seps(list(tsr_cells)) if tsr_cells else ([], [])
     line_row_seps = [float(s) for s in table.row_seps]
     line_col_seps = [float(s) for s in table.col_seps]
@@ -130,12 +212,35 @@ def _best_seps(tsr_cells: Sequence[Dict[str, Any]], table: DetectedTable) -> tup
         if row_seps is line_row_seps
         else _full_span_separators(row_seps, total_w)
     )
-    col_seps = line_col_seps if len(line_col_seps) >= len(tsr_col_seps) else tsr_col_seps
-    col_sps = (
-        list(table.v_separators)
-        if col_seps is line_col_seps
-        else _full_span_separators(col_seps, total_h)
-    )
+
+    tsr_n = max(len(tsr_col_seps) - 1, 0)
+    if len(line_col_seps) >= len(tsr_col_seps) and tsr_n >= 2:
+        pruned = _prune_micro_col_seps(line_col_seps, text_boxes)
+        extra_line = len(line_col_seps) - len(tsr_col_seps)
+        extra_pruned = len(pruned) - len(tsr_col_seps)
+        # 线网格列界虚高（小数假竖线）：剪枝后仍明显多于 TSR → 信任 TSR
+        if extra_line >= 3 and extra_pruned > max(2, tsr_n // 4):
+            col_seps = list(tsr_col_seps)
+            col_sps = _full_span_separators(col_seps, total_h)
+        elif len(pruned) >= len(tsr_col_seps):
+            col_seps = pruned
+            if len(pruned) == len(line_col_seps):
+                col_sps = list(table.v_separators)
+            else:
+                col_sps = _full_span_separators(col_seps, total_h)
+        else:
+            col_seps = list(tsr_col_seps)
+            col_sps = _full_span_separators(col_seps, total_h)
+    elif len(line_col_seps) > len(tsr_col_seps):
+        col_seps = line_col_seps
+        col_sps = list(table.v_separators)
+    else:
+        col_seps = list(tsr_col_seps) if tsr_col_seps else line_col_seps
+        col_sps = (
+            list(table.v_separators)
+            if col_seps is line_col_seps
+            else _full_span_separators(col_seps, total_h)
+        )
     return row_seps, col_seps, row_sps, col_sps
 
 
@@ -168,13 +273,16 @@ def fuse_tsr_with_lines(
     min_table_conf: float = 0.45,
     min_gain_cols: int = 1,
     merge_cover_thresh: float = 0.85,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Use line grid as atomic separators and TSR as merge prior."""
     table = _pick_table(tsr_cells, tables)
     if table is None:
         return tsr_cells
 
-    row_seps, col_seps, h_separators, v_separators = _best_seps(tsr_cells, table)
+    row_seps, col_seps, h_separators, v_separators = _best_seps(
+        tsr_cells, table, text_boxes
+    )
     n_rows = max(len(row_seps) - 1, 0)
     n_cols = max(len(col_seps) - 1, 0)
     tsr_rows, tsr_cols = _shape(tsr_cells)

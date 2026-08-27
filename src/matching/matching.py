@@ -28,6 +28,8 @@ from ..utils.label_patterns import (
     extract_independent_labels_from_joined,
     fix_iii_ocr,
     is_independent_row_label,
+    is_named_row_label,
+    looks_like_body_data_token,
     normalize_spaces,
     split_value_grade,
 )
@@ -139,6 +141,10 @@ def _parse_alternating_two_cjk_units(compact: str) -> Optional[List[str]]:
                 continue
             uniq = {p for p in parts if len(p) >= 2}
             if len(uniq) < 2:
+                continue
+            # 含数字时须真正交替重复（≥3 段）。否则「实族例52」会被
+            # 误切成「实族|例52」，「实施例51」亦然。
+            if any(re.search(r"\d", p) for p in parts) and len(parts) < 3:
                 continue
             score = len(parts) * 10 - abs(la - lb)
             if score > best_score:
@@ -1040,8 +1046,11 @@ def _row_tol_for_cell(
     """
     h = max(cb[3] - cb[1], 1.0)
     rs = max(int((cell or {}).get("row_span") or 1), 1)
-    use_frac = 0.65 if rs > 1 else frac
-    return max(12.0, h * use_frac)
+    if rs > 1:
+        # 高表头：中心偏中部，上下带 OCR 仍应命中
+        return max(12.0, h * 0.65)
+    # 单行格：勿用过大下限，否则矮表头下的表体同列会被当成「同行」切分目标
+    return max(4.0, h * frac)
 
 
 def _overlapping_atomic_cols(
@@ -1612,9 +1621,16 @@ def _try_split_across_cells(
                 continue
             cb = _cell_bbox(cell)
             cell_cy = (cb[1] + cb[3]) / 2.0
-            row_tol = _row_tol_for_cell(cb, cell, frac=0.6)
-            if abs(cell_cy - cy) > row_tol:
-                continue
+            rs = max(int(cell.get("row_span") or 1), 1)
+            if rs <= 1:
+                # 单行：文本中心须落在格内（小 pad），禁止表头/表体同列配对
+                pad = max(3.0, (cb[3] - cb[1]) * 0.2)
+                if cy < cb[1] - pad or cy > cb[3] + pad:
+                    continue
+            else:
+                row_tol = _row_tol_for_cell(cb, cell, frac=0.6)
+                if abs(cell_cy - cy) > row_tol:
+                    continue
             cell_w = max(cb[2] - cb[0], 1.0)
             xo = _x_overlap(tb_box, cb)
             if xo / cell_w < _MIN_CELL_COVER_FRAC:
@@ -1624,6 +1640,38 @@ def _try_split_across_cells(
         order = sorted(range(len(slots)), key=lambda k: slots[k][0])
         slots = [slots[k] for k in order]
         cell_targets = [cell_targets[k] for k in order]
+        # 同列上下格 x 几乎重合时只保留距文本更近的一格
+        if len(slots) >= 2:
+            kept_s: List[Tuple[float, float]] = []
+            kept_t: List[Optional[int]] = []
+            for si, (a, b) in enumerate(slots):
+                mid = (a + b) / 2.0
+                dup_j = None
+                for kj, (ka, kb) in enumerate(kept_s):
+                    if abs((ka + kb) / 2.0 - mid) < 0.35 * max(b - a, kb - ka, 1.0):
+                        dup_j = kj
+                        break
+                if dup_j is None:
+                    kept_s.append((a, b))
+                    kept_t.append(cell_targets[si])
+                    continue
+                # 保留 cy 更近者
+                old_i = kept_t[dup_j]
+                new_i = cell_targets[si]
+                old_cy = (
+                    (_cell_bbox(cells[old_i])[1] + _cell_bbox(cells[old_i])[3]) / 2.0
+                    if old_i is not None
+                    else 1e18
+                )
+                new_cy = (
+                    (_cell_bbox(cells[new_i])[1] + _cell_bbox(cells[new_i])[3]) / 2.0
+                    if new_i is not None
+                    else 1e18
+                )
+                if abs(new_cy - cy) < abs(old_cy - cy):
+                    kept_s[dup_j] = (a, b)
+                    kept_t[dup_j] = new_i
+            slots, cell_targets = kept_s, kept_t
     else:
         cell_targets = [None] * len(slots)
         for si, (a, b) in enumerate(slots):
@@ -2234,6 +2282,7 @@ def assign_texts_to_cells(
     _strip_lone_wufapingjia_digits(cells)
     _recover_wufapingjia_ref2_from_ocr(cells, text_boxes)
     cells = unmerge_filled_label_rowspans(cells)
+    cells = split_header_over_data_rowspans(cells)
     cells = explode_sticky_header_wide_cells(cells)
     realign_pair_left_numeric_cells(cells)
     return cells, free_texts
@@ -2307,6 +2356,145 @@ def _row_index_of(cy: float, row_seps: Sequence[float]) -> int:
     if row_seps and cy >= row_seps[-1]:
         return len(row_seps) - 2
     return -1
+
+
+def split_header_over_data_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    表头叶子 rowspan 盖住首行数据时按表体起点切开。
+
+    几何成因：子表头行与首行数据之间缺横线（或 body_row 误判），
+    hline_repair 把「种类」与「A-p-101」粘成 rowspan=2。
+    """
+    if not cells:
+        return cells
+    from ..structure.hline_repair import _first_body_row_index
+    from ..structure.header_topology import _looks_like_kind_or_amount_leaf
+
+    row_seps, col_seps = _derive_row_col_seps(cells)
+    if len(row_seps) < 3:
+        return cells
+    body_row = _first_body_row_index(cells, [], row_seps)
+    if body_row < 2:
+        return cells
+
+    out: List[Dict[str, Any]] = []
+    changed = False
+    for cell in cells:
+        rs, re = int(cell["row_start"]), int(cell["row_end"])
+        cs = int(cell["col_start"])
+        if rs >= body_row or re < body_row:
+            out.append(cell)
+            continue
+        if rs == body_row:
+            out.append(cell)
+            continue
+
+        texts_boxes = list(cell.get("texts") or [])
+        by_row: Dict[int, List[Dict[str, Any]]] = {r: [] for r in range(rs, re + 1)}
+        for tb in texts_boxes:
+            _x1, y1, _x2, y2 = _text_bbox(tb)
+            ri = _row_index_of((y1 + y2) / 2.0, row_seps)
+            if rs <= ri <= re:
+                by_row[ri].append(tb)
+
+        def _row_text(r: int) -> str:
+            tbs = by_row.get(r) or []
+            if tbs:
+                return join_cell_texts(tbs)
+            return ""
+
+        header_rows = list(range(rs, body_row))
+        body_rows = list(range(body_row, re + 1))
+        header_texts = [_row_text(r) for r in header_rows]
+        body_texts = [_row_text(r) for r in body_rows]
+
+        header_joined = "\n".join(t for t in header_texts if t).strip()
+        body_joined = "\n".join(t for t in body_texts if t).strip()
+
+        if not header_joined or not body_joined:
+            out.append(cell)
+            continue
+
+        # 左列命名行标签：仅裁掉误入表头带的行，不拆列头
+        if cs == 0 and is_named_row_label(body_joined):
+            if len(header_rows) == 1 and not is_named_row_label(header_joined):
+                x1, x2 = float(col_seps[cs]), float(col_seps[cs + 1])
+                y1, y2 = float(row_seps[rs]), float(row_seps[body_row])
+                cell["row_end"] = body_row - 1
+                cell["row_span"] = body_row - rs
+                cell["polygon"] = np.array(
+                    [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float64
+                )
+                out.append(cell)
+                y1b, y2b = float(row_seps[body_row]), float(row_seps[re + 1])
+                out.append(
+                    {
+                        "polygon": np.array(
+                            [[x1, y1b], [x2, y1b], [x2, y2b], [x1, y2b]],
+                            dtype=np.float64,
+                        ),
+                        "row_start": body_row,
+                        "row_end": re,
+                        "col_start": cs,
+                        "col_end": cs,
+                        "row_span": re - body_row + 1,
+                        "col_span": 1,
+                        "texts": by_row.get(body_row, []),
+                        "text": body_joined,
+                    }
+                )
+                changed = True
+                continue
+            out.append(cell)
+            continue
+
+        # 子表头叶子 + 下方数据：拆开 rowspan
+        if not (
+            _looks_like_kind_or_amount_leaf(header_joined)
+            or _looks_like_kind_or_amount_leaf(header_texts[-1] if header_texts else "")
+        ):
+            out.append(cell)
+            continue
+        if not looks_like_body_data_token(body_texts[0] if body_texts else body_joined):
+            out.append(cell)
+            continue
+
+        x1, x2 = float(col_seps[cs]), float(col_seps[cs + 1])
+        y1, y2 = float(row_seps[rs]), float(row_seps[body_row])
+        hdr = dict(cell)
+        hdr["row_end"] = body_row - 1
+        hdr["row_span"] = body_row - rs
+        hdr["polygon"] = np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float64
+        )
+        hdr["texts"] = []
+        for r in header_rows:
+            hdr["texts"].extend(by_row.get(r, []))
+        hdr["text"] = header_joined
+        out.append(hdr)
+
+        y1b, y2b = float(row_seps[body_row]), float(row_seps[re + 1])
+        body_cell = {
+            "polygon": np.array(
+                [[x1, y1b], [x2, y1b], [x2, y2b], [x1, y2b]], dtype=np.float64
+            ),
+            "row_start": body_row,
+            "row_end": re,
+            "col_start": cs,
+            "col_end": cs,
+            "row_span": re - body_row + 1,
+            "col_span": 1,
+            "texts": [],
+            "text": body_joined,
+        }
+        for r in body_rows:
+            body_cell["texts"].extend(by_row.get(r, []))
+        out.append(body_cell)
+        changed = True
+
+    if changed:
+        logger.info("split_header_over_data_rowspans: 拆开表头/首行数据 rowspan")
+    return out if changed else cells
 
 
 def unmerge_filled_label_rowspans(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

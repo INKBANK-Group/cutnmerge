@@ -26,6 +26,14 @@ logger = logging.getLogger(__name__)
 _DATA_ROW_RE = re.compile(
     r"(合成例|实施例|実施例|比較例|比较例|对照例|参考例)"
 )
+# 左侧行号标签（A-1 / B2 / (C)-3）；比「实施例」更可靠的表体起点信号
+_ROW_ID_RE = re.compile(
+    r"^[（(]?[A-Za-zΑ-Ωα-ω]{1,3}[)）]?-?\d{1,3}$"
+)
+# 纯数字子列带（1..17 / - 等），语言无关
+_NUM_SUBCOL_RE = re.compile(r"^[\-–—−]?\d{1,3}$")
+# 纯数字行号（37 / 51 等），常见于实施例块右侧序号列
+_INDEX_NUM_RE = re.compile(r"^\d{1,3}$")
 _PARENT_HDR_RE = re.compile(r"(单体\s*[\[［]|聚合物)")
 _CJK_RE = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]"
@@ -62,6 +70,40 @@ def _median_text_h(text_boxes: Sequence[Dict[str, Any]]) -> float:
 
 def _compact(text: str) -> str:
     return "".join((text or "").split())
+
+
+def _is_numeric_subcol_label(text: str) -> bool:
+    """表头数字子列（1..N 或 -），与语言无关。"""
+    t = _compact(text)
+    return bool(t and _NUM_SUBCOL_RE.match(t))
+
+
+def _numeric_subcol_band_rows(
+    cells: Sequence[Dict[str, Any]],
+    text_boxes: Sequence[Dict[str, Any]],
+    row_seps: Sequence[float],
+    left_cut: float,
+) -> List[int]:
+    """含 ≥3 个右侧数字子列的原子行 → 多级表头子行。"""
+    n_rows = max(0, len(row_seps) - 1)
+    out: List[int] = []
+    for r in range(n_rows):
+        count = 0
+        for c in cells:
+            if int(c["row_start"]) != r or int(c["row_end"]) != r:
+                continue
+            if int(c.get("col_span") or 1) != 1:
+                continue
+            t = _cell_header_text(c, text_boxes)
+            if not _is_numeric_subcol_label(t):
+                continue
+            x1, _, x2, _ = _cell_bbox(c)
+            if 0.5 * (x1 + x2) <= left_cut:
+                continue
+            count += 1
+        if count >= 3:
+            out.append(r)
+    return out
 
 
 def _is_fragment_text(text: str) -> bool:
@@ -253,6 +295,85 @@ def _ocr_texts_in_bbox(
     return [h[2] for h in hits]
 
 
+def _ocr_texts_in_column(
+    text_boxes: Sequence[Dict[str, Any]],
+    col_seps: Sequence[float],
+    col_idx: int,
+    y1: float,
+    y2: float,
+) -> List[str]:
+    """列 x 带内表头 OCR（不依赖 TSR 格 bbox，避免窄格漏检）。"""
+    if col_idx < 0 or col_idx + 1 >= len(col_seps):
+        return []
+    x1 = float(col_seps[col_idx])
+    x2 = float(col_seps[col_idx + 1])
+    return _ocr_texts_in_bbox(text_boxes, (x1, y1, x2, y2))
+
+
+def _header_texts_for_cell(
+    cell: Dict[str, Any],
+    text_boxes: Sequence[Dict[str, Any]],
+    col_seps: Sequence[float],
+    row_seps: Sequence[float],
+) -> List[str]:
+    """格 bbox 与列带 OCR 并集，供表头合并判定。"""
+    rs = int(cell["row_start"])
+    y1 = float(row_seps[rs])
+    y2 = float(row_seps[min(rs + 1, len(row_seps) - 1)])
+    parts: List[str] = []
+    seen: set = set()
+    for t in _ocr_texts_in_bbox(text_boxes, _cell_bbox(cell)):
+        key = _compact(t)
+        if key and key not in seen:
+            seen.add(key)
+            parts.append(t)
+    cs, ce = int(cell["col_start"]), int(cell["col_end"])
+    for col in range(cs, ce + 1):
+        for t in _ocr_texts_in_column(text_boxes, col_seps, col, y1, y2):
+            key = _compact(t)
+            if key and key not in seen:
+                seen.add(key)
+                parts.append(t)
+    return parts
+
+
+_LETTERED_CATEGORY_HDR_RE = re.compile(
+    r"^[\(（]\s*[A-Za-zΑ-Ωα-ω]\s*[\)）]"
+)
+
+
+def _looks_like_lettered_category_header(text: str) -> bool:
+    """(A)/(B) 等分类父头；与 header_topology 同义，避免循环导入。"""
+    t = _compact(text)
+    if not t or len(t) > 24:
+        return False
+    if _LETTERED_CATEGORY_HDR_RE.match(t):
+        return True
+    if re.search(r"[（(][A-Za-z][)）]", t) and _CJK_RE.search(t):
+        return True
+    return False
+
+
+def _absorb_pass2_forbidden(
+    left_texts: Sequence[str],
+    right_texts: Sequence[str],
+) -> bool:
+    """pass2 空邻吸收禁止：两侧均有独立表头证据时不合并。"""
+    l_join = " ".join(left_texts)
+    r_join = " ".join(right_texts)
+    if _looks_like_two_independent_subheaders(l_join, r_join):
+        return True
+    l_lettered = any(_looks_like_lettered_category_header(t) for t in left_texts)
+    r_lettered = any(_looks_like_lettered_category_header(t) for t in right_texts)
+    if l_lettered and r_lettered:
+        return True
+    if r_lettered and _is_complete_peer_label(_compact(r_join)):
+        return True
+    if l_lettered and _is_complete_peer_label(_compact(l_join)) and r_join.strip():
+        return True
+    return False
+
+
 def _header_text_from_ocr_union(
     text_boxes: Sequence[Dict[str, Any]],
     bbox: Tuple[float, float, float, float],
@@ -307,28 +428,150 @@ def _first_body_row_index(
     text_boxes: Sequence[Dict[str, Any]],
     row_seps: Sequence[float],
 ) -> int:
-    """返回首个表体逻辑行索引；找不到则退化为 min(3, n_rows)。"""
+    """返回首个表体逻辑行索引。
+
+    优先级：
+    1. 左侧行号标签（A-1 / B-2）—— 专利表最稳的表体起点；
+    2. 「实施例」等：仅当像行标签（偏左、同行不多列散布）时采用，
+       避免把列表头「实施例51..60」误当成表体；
+    3. 数值主导行（多级表头下方的数据行）；
+    4. 回退为 1（单行表头）。旧回退 min(3,n_rows) 会让 hline_repair
+       在无信号时把表头与首行数据错误合并。
+    """
     n_rows = max(0, len(row_seps) - 1)
     if n_rows <= 1:
         return n_rows
 
-    for r in range(n_rows):
-        y0, y1 = float(row_seps[r]), float(row_seps[r + 1])
-        for tb in text_boxes:
-            text = str(tb.get("text") or "")
-            if not _DATA_ROW_RE.search(text):
-                continue
-            _x1, by1, _x2, by2 = _tb_bbox(tb)
-            cy = 0.5 * (by1 + by2)
+    xs: List[float] = []
+    for tb in text_boxes:
+        x1, _y1, x2, _y2 = _tb_bbox(tb)
+        xs.extend((x1, x2))
+    for c in cells:
+        try:
+            x1, _y1, x2, _y2 = _cell_bbox(c)
+        except Exception:  # noqa: BLE001
+            continue
+        xs.extend((x1, x2))
+    table_x0 = min(xs) if xs else 0.0
+    table_x1 = max(xs) if xs else 1.0
+    table_w = max(table_x1 - table_x0, 1.0)
+    left_cut = table_x0 + 0.28 * table_w
+
+    def _row_of_y(cy: float) -> Optional[int]:
+        for r in range(n_rows):
+            y0, y1 = float(row_seps[r]), float(row_seps[r + 1])
             if y0 <= cy < y1:
                 return r
+        return None
+
+    # --- 1) 左侧行号标签 ---
+    id_rows: set[int] = set()
+    for tb in text_boxes:
+        text = _compact(str(tb.get("text") or ""))
+        if not _ROW_ID_RE.match(text):
+            continue
+        x1, by1, x2, by2 = _tb_bbox(tb)
+        if 0.5 * (x1 + x2) > left_cut:
+            continue
+        r = _row_of_y(0.5 * (by1 + by2))
+        if r is not None:
+            id_rows.add(r)
+    if id_rows:
+        return int(min(id_rows))
+
+    # --- 1c) 左侧「CJK+序号」命名行标签（分散液101 等）---
+    from ..utils.label_patterns import is_named_row_label
+
+    named_rows: set[int] = set()
+    for tb in text_boxes:
+        text = str(tb.get("text") or "")
+        if not is_named_row_label(text):
+            continue
+        x1, by1, x2, by2 = _tb_bbox(tb)
+        if 0.5 * (x1 + x2) > left_cut:
+            continue
+        r = _row_of_y(0.5 * (by1 + by2))
+        if r is not None:
+            named_rows.add(r)
+    for c in cells:
+        if int(c.get("col_start") or 0) > 0:
+            continue
+        raw = str(c.get("text") or "")
+        for part in re.split(r"[\n|/]+", raw):
+            if is_named_row_label(part.strip()):
+                named_rows.add(int(c["row_start"]))
+                break
+    if named_rows:
+        return int(min(named_rows))
+
+    # --- 1b) 左侧纯数字序号列（37–72 等）---
+    num_index_rows: set[int] = set()
+    for tb in text_boxes:
+        text = _compact(str(tb.get("text") or ""))
+        if not _INDEX_NUM_RE.match(text):
+            continue
+        x1, by1, x2, by2 = _tb_bbox(tb)
+        if 0.5 * (x1 + x2) > left_cut:
+            continue
+        r = _row_of_y(0.5 * (by1 + by2))
+        if r is not None:
+            num_index_rows.add(r)
+    if len(num_index_rows) >= 3:
+        return int(min(num_index_rows))
+
+    # --- 2) 「实施例」类：区分列头 vs 行标签 ---
+    example_hits: Dict[int, List[float]] = {}
+    for tb in text_boxes:
+        text = str(tb.get("text") or "")
+        if not _DATA_ROW_RE.search(text):
+            continue
+        x1, by1, x2, by2 = _tb_bbox(tb)
+        r = _row_of_y(0.5 * (by1 + by2))
+        if r is None:
+            continue
+        example_hits.setdefault(r, []).append(0.5 * (x1 + x2))
+
+    for r in sorted(example_hits.keys()):
+        xs_hit = example_hits[r]
+        if len(xs_hit) >= 3 and (max(xs_hit) - min(xs_hit)) > 0.25 * table_w:
+            continue  # 同行多列「实施例*」→ 列表头
+        if all(x <= left_cut for x in xs_hit):
+            return int(r)
+
+    # --- 2b) 数字子列带（Example 1..17 / 比较例 1..14 等，语言无关）---
+    band_rows = _numeric_subcol_band_rows(cells, text_boxes, row_seps, left_cut)
+    if band_rows:
+        return int(max(band_rows)) + 1
 
     for c in cells:
         text = str(c.get("text") or "")
-        if _DATA_ROW_RE.search(text):
-            return int(c["row_start"])
+        if not _DATA_ROW_RE.search(text):
+            continue
+        if int(c.get("col_span") or 1) >= 2 or int(c["col_start"]) >= 2:
+            continue
+        return int(c["row_start"])
 
-    return min(3, n_rows)
+    # --- 3) 数值主导行（多级表头后的首个数据行）---
+    _num_re = re.compile(r"^[-+]?\d+(?:\.\d+)?%?$")
+    texts_by_row: Dict[int, List[str]] = {}
+    for tb in text_boxes:
+        t = _compact(str(tb.get("text") or ""))
+        if not t:
+            continue
+        _x1, by1, _x2, by2 = _tb_bbox(tb)
+        r = _row_of_y(0.5 * (by1 + by2))
+        if r is not None:
+            texts_by_row.setdefault(r, []).append(t)
+    for r in range(n_rows):
+        texts = texts_by_row.get(r) or []
+        if len(texts) < 2:
+            continue
+        n_num = sum(1 for t in texts if _num_re.match(t))
+        if n_num >= max(2, (len(texts) + 1) // 2):
+            return int(r)
+
+    # --- 4) 保守回退：单行表头 ---
+    return 1 if n_rows > 1 else n_rows
 
 
 def _same_col_key(cell: Dict[str, Any]) -> Tuple[int, int]:
@@ -482,6 +725,19 @@ def repair_rowspans_by_hline_gaps(
             if ink >= min_ink_ratio and not short_cjk_merge:
                 continue
 
+            from ..utils.label_patterns import is_named_row_label, looks_like_body_data_token
+            from .header_topology import _looks_like_kind_or_amount_leaf
+
+            if is_named_row_label(l_joined) or is_named_row_label(u_joined):
+                continue
+            if (
+                lower_row >= body_row - 1
+                and upper_row < body_row
+                and _looks_like_kind_or_amount_leaf(u_joined)
+                and looks_like_body_data_token(l_joined)
+            ):
+                continue
+
             u_h = max(0.0, y2 - y1)
             l_h = max(0.0, ly2 - ly1)
             u_frag = _is_fragment_text(u_joined)
@@ -546,6 +802,262 @@ def repair_rowspans_by_hline_gaps(
             max_boundary - 1,
         )
     return work
+
+
+def collapse_body_data_sliver_rows(
+    cells: List[Dict[str, Any]],
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    表体数据列「上空下实」的幽灵缝行并入下方行。
+
+    全宽横线把左行头折成两行时，左列可能已 rowspan，但数据列仍残留空 sliver；
+    按数据区列检查空/实后折叠行号，并合并左列折行文本。
+    """
+    if not cells:
+        return cells
+
+    from .tsr_refine import _infer_data_col_start
+
+    text_boxes = list(text_boxes or [])
+    row_seps, col_seps = _derive_seps(cells)
+    if len(row_seps) < 3:
+        return cells
+
+    data_col_start = _infer_data_col_start(col_seps, cells, text_boxes)
+    if data_col_start <= 0:
+        return cells
+
+    max_row = max(int(c["row_end"]) for c in cells)
+    body_row = _first_body_row_index(cells, text_boxes, row_seps)
+
+    _num_re = re.compile(r"^[-+]?\d+(?:\.\d+)?%?$")
+
+    def _row_data_nonempty(row: int) -> bool:
+        for c in cells:
+            if int(c["row_start"]) > row or int(c["row_end"]) < row:
+                continue
+            if int(c["col_start"]) < data_col_start:
+                continue
+            t = str(c.get("text") or "").strip()
+            if not t:
+                continue
+            compact = _compact(t)
+            # 表体数值（含单位格）视为实质数据，不可被碎片规则滤掉
+            if _num_re.match(compact):
+                return True
+            if _is_fragment_text(t):
+                continue
+            if len(compact) >= 2:
+                return True
+        return False
+
+    def _row_data_empty(row: int) -> bool:
+        for c in cells:
+            if int(c["row_start"]) > row or int(c["row_end"]) < row:
+                continue
+            if int(c["col_start"]) < data_col_start:
+                continue
+            if str(c.get("text") or "").strip():
+                return False
+        return True
+
+    def _row_has_index_label(row: int) -> bool:
+        for c in cells:
+            if int(c["row_start"]) > row or int(c["row_end"]) < row:
+                continue
+            if int(c["col_start"]) >= data_col_start:
+                continue
+            t = _compact(str(c.get("text") or ""))
+            if _INDEX_NUM_RE.match(t) or _ROW_ID_RE.match(t):
+                return True
+        return False
+
+    dropped: set[int] = set()
+    for row in range(body_row, max_row):
+        if row in dropped:
+            continue
+        if not _row_data_empty(row):
+            continue
+        if not _row_data_nonempty(row + 1):
+            continue
+        # 数据列空行，且上下邻行有实质数据或序号标签 → 假横线 seam
+        if _row_data_nonempty(row - 1):
+            dropped.add(row)
+            continue
+        if _row_has_index_label(row - 1) and _row_has_index_label(row + 1):
+            dropped.add(row)
+
+    if not dropped:
+        return cells
+
+    # 合并被删行上的左列折行文本到下一保留行
+    for row in sorted(dropped):
+        lower = row + 1
+        while lower in dropped and lower <= max_row:
+            lower += 1
+        if lower > max_row:
+            continue
+        upper_parts: List[str] = []
+        lower_parts: List[str] = []
+        for c in cells:
+            if int(c["col_start"]) >= data_col_start:
+                continue
+            rs, re_ = int(c["row_start"]), int(c["row_end"])
+            t = str(c.get("text") or "").strip()
+            if not t:
+                continue
+            if rs <= row <= re_:
+                upper_parts.append(t)
+            if rs <= lower <= re_:
+                lower_parts.append(t)
+        if upper_parts and lower_parts:
+            if upper_parts == lower_parts:
+                merged = upper_parts[0]
+            else:
+                # 去重：同一 rowspan 格会被上下行各计一次
+                seen: set[str] = set()
+                parts: List[str] = []
+                for p in upper_parts + lower_parts:
+                    if p not in seen:
+                        seen.add(p)
+                        parts.append(p)
+                merged = "\n".join(parts)
+            for c in cells:
+                if int(c["col_start"]) >= data_col_start:
+                    continue
+                rs, re_ = int(c["row_start"]), int(c["row_end"])
+                if rs <= lower <= re_:
+                    c["text"] = merged
+                    if rs < lower:
+                        c["row_start"] = lower
+                        _refresh_spans(c)
+                    break
+
+    kept_rows = [i for i in range(max_row + 1) if i not in dropped]
+    remap = {old: new for new, old in enumerate(kept_rows)}
+    out: List[Dict[str, Any]] = []
+    for c in cells:
+        rs, re_ = int(c["row_start"]), int(c["row_end"])
+        new_idxs = [remap[i] for i in range(rs, re_ + 1) if i in remap]
+        if not new_idxs:
+            continue
+        nc = dict(c)
+        nc["row_start"] = min(new_idxs)
+        nc["row_end"] = max(new_idxs)
+        nc["row_span"] = nc["row_end"] - nc["row_start"] + 1
+        out.append(nc)
+
+    logger.info("表体数据 sliver 行折叠: dropped=%s", sorted(dropped))
+    return out
+
+
+def split_data_cells_at_stub_row_boundaries(
+    cells: List[Dict[str, Any]],
+    binary: np.ndarray,
+    text_boxes: Optional[Sequence[Dict[str, Any]]] = None,
+    *,
+    tol: float = 4.0,
+    stub_hline_min: float = 0.30,
+    data_hline_max: float = 0.25,
+) -> List[Dict[str, Any]]:
+    """
+    表体行界仅在 stub 区有贯通横线、数据区无横线时，切开跨越该界的数据 rowspan。
+
+    典型：左列「种类|质量份」已分两行，右侧 A-1/100 仍被 TSR 合成 rowspan≥2。
+    """
+    if not cells or binary is None or binary.size == 0:
+        return cells
+
+    from .tsr_refine import _infer_data_col_start
+
+    text_boxes = list(text_boxes or [])
+    row_seps, col_seps = _derive_seps(cells)
+    if len(row_seps) < 4 or len(col_seps) < 4:
+        return cells
+
+    data_col_start = _infer_data_col_start(col_seps, cells, text_boxes)
+    if data_col_start <= 0 or data_col_start >= len(col_seps) - 1:
+        return cells
+
+    body_row = _first_body_row_index(cells, text_boxes, row_seps)
+    n_rows = len(row_seps) - 1
+    if body_row >= n_rows - 2:
+        return cells
+
+    stub_x1 = float(col_seps[0])
+    stub_x2 = float(col_seps[data_col_start])
+    data_x1 = stub_x2
+    data_x2 = float(col_seps[-1])
+
+    def _atomic_stub_pair(upper: int, lower: int) -> bool:
+        up = lo = None
+        for c in cells:
+            if int(c["col_start"]) >= data_col_start:
+                continue
+            rs, re_ = int(c["row_start"]), int(c["row_end"])
+            if rs == re_ == upper:
+                up = c
+            if rs == re_ == lower:
+                lo = c
+        return up is not None and lo is not None
+
+    work = [dict(c) for c in cells]
+    to_drop: set = set()
+    to_add: List[Dict[str, Any]] = []
+    changed = 0
+
+    for boundary in range(body_row, n_rows - 1):
+        y = float(row_seps[boundary + 1])
+        stub_ink = _hline_coverage_ratio(binary, y, stub_x1, stub_x2, tol=tol)
+        data_ink = _hline_coverage_ratio(binary, y, data_x1, data_x2, tol=tol)
+        if stub_ink < stub_hline_min or data_ink >= data_hline_max:
+            continue
+        if not _atomic_stub_pair(boundary, boundary + 1):
+            continue
+
+        for cell in work:
+            if id(cell) in to_drop:
+                continue
+            cs = int(cell["col_start"])
+            if cs < data_col_start:
+                continue
+            rs, re_ = int(cell["row_start"]), int(cell["row_end"])
+            if rs > boundary or re_ < boundary + 1 or re_ <= rs:
+                continue
+
+            ce = int(cell["col_end"])
+            x1 = float(col_seps[cs]) if cs < len(col_seps) else _cell_bbox(cell)[0]
+            x2 = (
+                float(col_seps[ce + 1])
+                if ce + 1 < len(col_seps)
+                else _cell_bbox(cell)[2]
+            )
+            for r in range(rs, re_ + 1):
+                if r >= len(row_seps) - 1:
+                    continue
+                y1 = float(row_seps[r])
+                y2 = float(row_seps[r + 1])
+                nc = dict(cell)
+                nc["row_start"] = r
+                nc["row_end"] = r
+                nc["row_span"] = 1
+                nc["polygon"] = _rebuild_polygon(x1, y1, x2, y2)
+                nc["x_key"] = x1
+                nc["y_key"] = y1
+                nc["texts"] = []
+                nc["text"] = ""
+                to_add.append(nc)
+            to_drop.add(id(cell))
+            changed += 1
+
+    if not changed:
+        return cells
+
+    out = [c for c in work if id(c) not in to_drop]
+    out.extend(to_add)
+    logger.info("stub 局部行界切开数据 rowspan: %d 格", changed)
+    return out
 
 
 def repair_colspans_by_vline_gaps(
@@ -653,11 +1165,17 @@ def repair_colspans_by_vline_gaps(
                 r_idx, right = row_cells[ci + 1]
                 if int(left["col_end"]) + 1 != int(right["col_start"]):
                     continue
-                l_texts = _ocr_texts_in_bbox(text_boxes, _cell_bbox(left))
-                r_texts = _ocr_texts_in_bbox(text_boxes, _cell_bbox(right))
+                l_texts = _header_texts_for_cell(
+                    left, text_boxes, col_seps, row_seps
+                )
+                r_texts = _header_texts_for_cell(
+                    right, text_boxes, col_seps, row_seps
+                )
                 l_has_text = any(t.strip() for t in l_texts)
                 r_has_text = any(t.strip() for t in r_texts)
                 if l_has_text == r_has_text:
+                    continue
+                if _absorb_pass2_forbidden(l_texts, r_texts):
                     continue
                 col_boundary = int(right["col_start"])
                 if col_boundary < 1 or col_boundary >= len(col_seps):
@@ -715,6 +1233,38 @@ _SUBHEADER_TYPE_RE = re.compile(
 _SUBHEADER_AMOUNT_RE = re.compile(
     r"^(量|添加量|含量|用量|摩尔|质量|份数)"
 )
+
+
+def _is_leaf_kind_header(text: str) -> bool:
+    """叶子表头「种类/类型」列 — 重复出现时分组边界。"""
+    t = _compact(text or "")
+    if not t:
+        return False
+    if _SUBHEADER_TYPE_RE.match(t):
+        return True
+    return t in ("種類", "類型", "类型", "名称", "名稱", "组分", "組分")
+
+
+def _leaf_kind_count(bottom_labels: Sequence[str]) -> int:
+    return sum(1 for t in bottom_labels if _is_leaf_kind_header(t))
+
+
+def _sub_cols_for_single_parent_group(
+    sub_cols: Sequence[int],
+    bottom_labels: Sequence[str],
+) -> List[int]:
+    """子列范围截到第一个「种类」分组结束（遇第二个种类列即停）。"""
+    if not sub_cols:
+        return []
+    out: List[int] = []
+    kind_seen = 0
+    for sc, lab in zip(sub_cols, bottom_labels):
+        if _is_leaf_kind_header(lab):
+            kind_seen += 1
+            if kind_seen >= 2:
+                break
+        out.append(int(sc))
+    return out if out else [int(sub_cols[0])]
 _SUBHEADER_METRIC_RE = re.compile(
     r"(pKa|保护率|反应率|浓度|比率|比例|率[\(%）]|值[\(%）])",
     re.IGNORECASE,
@@ -750,6 +1300,9 @@ def _is_header_shard(text: str) -> bool:
     if _SUBHEADER_AMOUNT_RE.match(t):
         return False
     if _SUBHEADER_METRIC_RE.search(t):
+        return False
+    # 3 字完整化学类名（*剂/*物/*素）→ 独立父头，勿当折行碎片
+    if len(t) == 3 and t[-1] in "剂物素":
         return False
     return True
 
@@ -810,6 +1363,13 @@ def _are_mergeable_parent_shards(left: str, right: str) -> bool:
         return True
     if not lc or not rc:
         return False
+    # 两个完整独立父头（非折行碎片）→ 不跨类合并
+    _unit = {"col_span": 1, "row_span": 1}
+    if (
+        _is_standalone_parent_header(_unit, left)
+        and _is_standalone_parent_header(_unit, right)
+    ):
+        return False
     # 通式折行误拆：两侧虽不像短碎片，仍是同一父头
     if _are_formula_header_complements(left, right):
         return True
@@ -830,6 +1390,11 @@ def _are_mergeable_parent_shards(left: str, right: str) -> bool:
     # 经典双短碎片：「酸催」+「化剂」
     if _is_header_shard(lc) and _is_header_shard(rc):
         return True
+    # 左短碎片 + 右续词（射线吸|收调节剂）：右格非子表头标签
+    if _is_header_shard(lc) and 2 <= len(rc) <= 8 and _CJK_RE.search(rc):
+        if not _SUBHEADER_TYPE_RE.match(rc) and not _SUBHEADER_AMOUNT_RE.match(rc):
+            if _PARENT_INCOMPLETE_TAIL_RE.search(lc) or rc[0] in "收化调剂络活溶":
+                return True
     # 两侧皆碎片且左非已收束续头（空|残尾等）
     if _is_parent_header_fragment(left) and _is_parent_header_fragment(right):
         if _PARENT_INCOMPLETE_TAIL_RE.search(lc) or not lc:
@@ -1228,6 +1793,9 @@ def _should_merge_parent_shard_run(
     top_texts = [t for t in top_labels if t]
     bottom_texts = [t for t in bottom_labels if t]
     frag_count = sum(1 for t in top_labels if _is_parent_header_fragment(t))
+    # 下方已有多个「种类」列 → 对应多个独立父头组，禁止横向吞并
+    if _leaf_kind_count(bottom_labels) >= 2:
+        return False
     # 通式(5)…|、通式(6)… 盖在 种类|含量 上：强制合并为 colspan=2
     if (
         len(top_texts) == 2
@@ -1277,7 +1845,22 @@ def _merge_parent_shards_on_row(
         run_cols: List[int] = [col]
         c = col
         while c + 1 <= max_col:
-            nxt = _header_origin_at(work, parent_row, c + 1)
+            nxt_col = c + 1
+            # 子表头行第二个「种类」列 → 新父头组起点，停止扩 run
+            nxt_leaf = _labels_in_row_range(
+                work, sub_row, nxt_col, nxt_col, text_boxes
+            )[0]
+            if _is_leaf_kind_header(nxt_leaf):
+                run_kinds = sum(
+                    1
+                    for rc in run_cols
+                    if _is_leaf_kind_header(
+                        _labels_in_row_range(work, sub_row, rc, rc, text_boxes)[0]
+                    )
+                )
+                if run_kinds >= 1:
+                    break
+            nxt = _header_origin_at(work, parent_row, nxt_col)
             if nxt is None:
                 break
             cur = _header_origin_at(work, parent_row, c)
@@ -1285,7 +1868,7 @@ def _merge_parent_shards_on_row(
             nxt_t = _cell_header_text(nxt, text_boxes)
             if not _are_mergeable_parent_shards(cur_t, nxt_t):
                 break
-            run_cols.append(c + 1)
+            run_cols.append(nxt_col)
             c += 1
 
         cs, ce = run_cols[0], run_cols[-1]
@@ -1298,6 +1881,7 @@ def _merge_parent_shards_on_row(
         bottom_labels = [
             _labels_in_row_range(work, sub_row, sc, sc, text_boxes)[0] for sc in sub_cols
         ] if sub_cols else _labels_in_row_range(work, sub_row, cs, ce, text_boxes)
+        group_sub_cols = _sub_cols_for_single_parent_group(sub_cols, bottom_labels)
 
         if len(run_cols) >= 2 and _should_merge_parent_shard_run(
             top_labels, bottom_labels
@@ -1335,8 +1919,8 @@ def _merge_parent_shards_on_row(
                         merged["row_start"] = parent_row
                         merged["row_end"] = parent_row
                     _refresh_spans(merged)
-                if sub_cols and sub_cols[-1] > int(merged["col_end"]):
-                    merged["col_end"] = sub_cols[-1]
+                if sub_cols and group_sub_cols and group_sub_cols[-1] > int(merged["col_end"]):
+                    merged["col_end"] = group_sub_cols[-1]
                     _refresh_spans(merged)
                     lx1, ly1, lx2, ly2 = _cell_bbox(merged)
                     rx = _cell_bbox(cells_to_merge[-1])[2]
@@ -1469,7 +2053,21 @@ def repair_parent_header_shard_colspans(
         run_cols: List[int] = [col]
         c = col
         while c + 1 <= max_col:
-            nxt = _atomic_cell_at_row_col(work, parent_row, c + 1)
+            nxt_col = c + 1
+            nxt_leaf = _labels_in_row_range(
+                work, sub_row, nxt_col, nxt_col, text_boxes
+            )[0]
+            if _is_leaf_kind_header(nxt_leaf):
+                run_kinds = sum(
+                    1
+                    for rc in run_cols
+                    if _is_leaf_kind_header(
+                        _labels_in_row_range(work, sub_row, rc, rc, text_boxes)[0]
+                    )
+                )
+                if run_kinds >= 1:
+                    break
+            nxt = _atomic_cell_at_row_col(work, parent_row, nxt_col)
             if nxt is None:
                 break
             cur = _atomic_cell_at_row_col(work, parent_row, c)
@@ -1477,7 +2075,7 @@ def repair_parent_header_shard_colspans(
             nxt_t = _cell_header_text(nxt, text_boxes)
             if not _are_mergeable_parent_shards(cur_t, nxt_t):
                 break
-            run_cols.append(c + 1)
+            run_cols.append(nxt_col)
             c += 1
 
         cs, ce = run_cols[0], run_cols[-1]
@@ -1488,6 +2086,7 @@ def repair_parent_header_shard_colspans(
         bottom_labels = [
             _labels_in_row_range(work, sub_row, sc, sc, text_boxes)[0] for sc in sub_cols
         ] if sub_cols else _labels_in_row_range(work, sub_row, cs, ce, text_boxes)
+        group_sub_cols = _sub_cols_for_single_parent_group(sub_cols, bottom_labels)
 
         if len(run_cols) >= 2 and _should_merge_parent_shard_run(
             top_labels, bottom_labels
@@ -1515,8 +2114,8 @@ def repair_parent_header_shard_colspans(
                     merged["row_start"] = parent_row
                     merged["row_end"] = parent_row
                     _refresh_spans(merged)
-                if sub_cols and sub_cols[-1] > int(merged["col_end"]):
-                    merged["col_end"] = sub_cols[-1]
+                if sub_cols and group_sub_cols and group_sub_cols[-1] > int(merged["col_end"]):
+                    merged["col_end"] = group_sub_cols[-1]
                     _refresh_spans(merged)
                     lx1, ly1, lx2, ly2 = _cell_bbox(merged)
                     rx = _cell_bbox(cells_to_merge[-1])[2]
