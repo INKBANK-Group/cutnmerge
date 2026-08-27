@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,13 +59,31 @@ def _maybe_downscale(image: np.ndarray) -> Tuple[np.ndarray, float]:
     return resized, scale
 
 
-def _classify_table(table_cls: Any, image: np.ndarray) -> str:
+def _classify_table(table_cls: Any, infer_image: np.ndarray) -> str:
     """返回 'wired' 或 'lineless'。"""
-    cls_out, _elapse = table_cls(image)
+    cls_out, _elapse = table_cls(infer_image)
     label = str(cls_out).strip().lower()
     if label in {"wired", "wire", "有线"}:
         return "wired"
     return "lineless"
+
+
+def _normalize_tsr_quad(poly: np.ndarray) -> List[List[float]]:
+    """
+    转为 wired_table_rec match_ocr_cell 期望的四点序：左上、右上、右下、左下。
+
+    match_ocr_cell 用 index 0 与 2 取 xmin/ymin/xmax/ymax，角点顺序错误会导致
+    OCR 框与单元格无法匹配，HTML 行列错位（散架）。
+    """
+    arr = np.asarray(poly, dtype=np.float64).reshape(-1, 2)
+    xmin, ymin = arr.min(axis=0)
+    xmax, ymax = arr.max(axis=0)
+    return [
+        [float(xmin), float(ymin)],
+        [float(xmax), float(ymin)],
+        [float(xmax), float(ymax)],
+        [float(xmin), float(ymax)],
+    ]
 
 
 def text_boxes_to_ocr_result(
@@ -85,11 +104,130 @@ def text_boxes_to_ocr_result(
             continue
         if abs(scale - 1.0) > 1e-9:
             poly = poly * float(scale)
-        box = poly[:4].tolist()
+        box = _normalize_tsr_quad(poly)
         text = str(tb.get("text") or "")
         score = float(tb.get("score", 1.0) or 1.0)
         out.append((box, text, score))
     return out
+
+
+def _assign_text_boxes_to_cells(
+    text_boxes: List[Dict[str, Any]],
+    cell_polygons: np.ndarray,
+    *,
+    scale: float = 1.0,
+) -> List[Tuple[Any, str, float]]:
+    """
+    按 OCR 中心点落入的物理单元格分组；ocr_result 的 box 用单元格四角。
+
+    云端 Paddle 检测框与 wired match_ocr_cell 的 IoU 匹配易错位，
+    导致文字进错逻辑格、HTML 散架；吸附到结构检测格可对齐原型 RapidOCR 行为。
+    """
+    cells = np.asarray(cell_polygons, dtype=np.float64).reshape(-1, 4, 2)
+    if cells.size == 0:
+        return []
+    if abs(scale - 1.0) > 1e-9:
+        cells = cells * float(scale)
+
+    cell_boxes = [_normalize_tsr_quad(c) for c in cells]
+    groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+
+    def _cell_center(cbox: List[List[float]]) -> Tuple[float, float]:
+        xmin, ymin = cbox[0]
+        xmax, ymax = cbox[2]
+        return (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
+
+    for tb in text_boxes or []:
+        poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if poly.shape[0] < 4:
+            continue
+        if abs(scale - 1.0) > 1e-9:
+            poly = poly * float(scale)
+        cx = float(poly[:, 0].mean())
+        cy = float(poly[:, 1].mean())
+        best_i = -1
+        best_score: Optional[float] = None
+        for i, cbox in enumerate(cell_boxes):
+            xmin, ymin = cbox[0]
+            xmax, ymax = cbox[2]
+            pad = 4.0
+            if (
+                xmin - pad > cx
+                or xmax + pad < cx
+                or ymin - pad > cy
+                or ymax + pad < cy
+            ):
+                continue
+            ccx, ccy = _cell_center(cbox)
+            dist2 = (cx - ccx) ** 2 + (cy - ccy) ** 2
+            area = max((xmax - xmin) * (ymax - ymin), 1.0)
+            score = dist2 / area
+            if best_score is None or score < best_score:
+                best_score = score
+                best_i = i
+        if best_i < 0:
+            # 竖排表头等：中心点不在格内时，取最近单元格
+            best_dist = float("inf")
+            for i, cbox in enumerate(cell_boxes):
+                ccx, ccy = _cell_center(cbox)
+                dist2 = (cx - ccx) ** 2 + (cy - ccy) ** 2
+                if dist2 < best_dist:
+                    best_dist = dist2
+                    best_i = i
+        if best_i >= 0:
+            groups[best_i].append(tb)
+
+    def _sort_key(tb: Dict[str, Any]) -> Tuple[float, float]:
+        tl = tb.get("top_left")
+        if isinstance(tl, dict):
+            return (float(tl.get("y", 0)), float(tl.get("x", 0)))
+        poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        return (float(poly[:, 1].min()), float(poly[:, 0].min()))
+
+    out: List[Tuple[Any, str, float]] = []
+    for i, cbox in enumerate(cell_boxes):
+        items = groups.get(i)
+        if not items:
+            continue
+        items.sort(key=_sort_key)
+        for tb in items:
+            text = str(tb.get("text") or "").strip()
+            if not text:
+                continue
+            out.append((cbox, text, float(tb.get("score", 1.0) or 1.0)))
+    return out
+
+
+def _wired_ocr_result_from_cells(
+    wired_engine: Any,
+    infer_img: np.ndarray,
+    text_boxes: List[Dict[str, Any]],
+    *,
+    scale: float = 1.0,
+) -> List[Tuple[Any, str, float]]:
+    """有线路径：结构检测后把云端 OCR 吸附到物理单元格再交给 wired。"""
+    table_structure = getattr(wired_engine, "table_structure", None)
+    if table_structure is None:
+        return text_boxes_to_ocr_result(text_boxes, scale=scale)
+    polygons, _rot = table_structure(infer_img)
+    if polygons is None or getattr(polygons, "size", 0) == 0:
+        return text_boxes_to_ocr_result(text_boxes, scale=scale)
+    polygons = np.asarray(polygons).reshape(-1, 4, 2).copy()
+    # 与 WiredTableRecognition.__call__ 中 match_ocr_cell 使用的 polygons 对齐
+    polygons[:, 1, :], polygons[:, 3, :] = (
+        polygons[:, 3, :].copy(),
+        polygons[:, 1, :].copy(),
+    )
+    snapped = _assign_text_boxes_to_cells(text_boxes, polygons, scale=scale)
+    if snapped:
+        logger.info(
+            "wired OCR 吸附: raw=%d snapped=%d cells=%d",
+            len(text_boxes or []),
+            len(snapped),
+            len(polygons),
+        )
+        return snapped
+    return text_boxes_to_ocr_result(text_boxes, scale=scale)
 
 
 def _run_engine_with_ocr(
@@ -98,10 +236,10 @@ def _run_engine_with_ocr(
     ocr_result: List[Tuple[Any, str, float]],
 ) -> Any:
     """调用 TSR 引擎，传入外部 OCR 结果（不使用 RapidOCR）。"""
+    # need_ocr=False 会跳过 OCR 填格并返回空 pred_html，不可作为回退
     attempts = [
         {"ocr_result": ocr_result, "need_ocr": True},
         {"ocr_result": ocr_result},
-        {"ocr_result": ocr_result, "need_ocr": False},
     ]
     last_exc: Exception | None = None
     for kwargs in attempts:
@@ -110,12 +248,9 @@ def _run_engine_with_ocr(
         except TypeError as exc:
             last_exc = exc
             continue
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            continue
     if last_exc is not None:
         raise last_exc
-    return engine(image, ocr_result=ocr_result)
+    return engine(image, ocr_result=ocr_result, need_ocr=True)
 
 
 def predict_table_html(
@@ -144,7 +279,12 @@ def predict_table_html(
         kind = "lineless"
 
     engine = wired_engine if kind == "wired" else lineless_engine
-    ocr_result = text_boxes_to_ocr_result(text_boxes, scale=scale)
+    if kind == "wired":
+        ocr_result = _wired_ocr_result_from_cells(
+            wired_engine, infer_img, text_boxes, scale=scale
+        )
+    else:
+        ocr_result = text_boxes_to_ocr_result(text_boxes, scale=scale)
     logger.info("TSR 路径: %s，ocr_boxes=%d", kind, len(ocr_result))
 
     result = _run_engine_with_ocr(engine, infer_img, ocr_result)
