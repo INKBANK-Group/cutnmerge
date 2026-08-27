@@ -1,22 +1,14 @@
-"""TableStructureRec 结构识别：有线/无线分流，只取单元格框 + 逻辑拓扑。
-
-不使用库内 RapidOCR / pred_html；文本仍由云端 OCR + IoA 填格。
-"""
+"""TableStructureRec：云端 PaddleOCR 作 ocr_result，输出 pred_html。"""
 
 from __future__ import annotations
 
 import logging
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-
-from ..core.models import (
-    _correct_columns_by_physical_x,
-    _correct_rows_by_physical_y,
-    _to_quad,
-    _top_left_from_quad,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -66,354 +58,81 @@ def _maybe_downscale(image: np.ndarray) -> Tuple[np.ndarray, float]:
     return resized, scale
 
 
-def _bbox_to_quad(box: Any) -> Optional[np.ndarray]:
-    """兼容 [xmin,ymin,xmax,ymax] / 8 点 / (4,2) → (4,2) quad。"""
-    arr = np.asarray(box, dtype=np.float64)
-    if arr.size == 4:
-        return _to_quad(arr.reshape(4))
-    if arr.size == 8:
-        return _to_quad(arr.reshape(4, 2))
-    if arr.ndim == 2 and arr.shape[0] >= 4 and arr.shape[1] == 2:
-        return _to_quad(arr[:4])
-    return _to_quad(arr)
-
-
-def _parse_logic(row: Any) -> Optional[Tuple[int, int, int, int]]:
-    arr = np.asarray(row, dtype=np.float64).reshape(-1)
-    if arr.size < 4:
-        return None
-    vals = [int(round(float(x))) for x in arr[:4].tolist()]
-    row_start, row_end, col_start, col_end = vals
-    if row_end < row_start:
-        row_start, row_end = row_end, row_start
-    if col_end < col_start:
-        col_start, col_end = col_end, col_start
-    return row_start, row_end, col_start, col_end
-
-
-def _result_to_cells(
-    cell_bboxes: Any,
-    logic_points: Any,
-    *,
-    scale: float,
-) -> List[Dict[str, Any]]:
-    """将 TSR 输出转为与 LORE 一致的 cell_dict 列表，并还原到原图坐标。"""
-    if cell_bboxes is None or logic_points is None:
-        return []
-
-    boxes = list(cell_bboxes) if not isinstance(cell_bboxes, np.ndarray) else [
-        cell_bboxes[i] for i in range(len(cell_bboxes))
-    ]
-    logics = list(logic_points) if not isinstance(logic_points, np.ndarray) else [
-        logic_points[i] for i in range(len(logic_points))
-    ]
-    if len(boxes) != len(logics):
-        raise RuntimeError(
-            f"TSR cell_bboxes 数量（{len(boxes)}）与 logic_points（{len(logics)}）不一致"
-        )
-    if not boxes:
-        return []
-
-    inv = 1.0 / scale if scale > 1e-9 else 1.0
-    parsed: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
-    for box, logic in zip(boxes, logics):
-        quad = _bbox_to_quad(box)
-        logi = _parse_logic(logic)
-        if quad is None or logi is None:
-            continue
-        if inv != 1.0:
-            quad = quad * inv
-        parsed.append((quad, logi))
-
-    if not parsed:
-        return []
-
-    min_row = min(r for _, (r, _, _, _) in parsed)
-    min_col = min(c for _, (_, _, c, _) in parsed)
-
-    cells: List[Dict[str, Any]] = []
-    for quad, (row_start, row_end, col_start, col_end) in parsed:
-        ns, ne = row_start - min_row, row_end - min_row
-        cs, ce = col_start - min_col, col_end - min_col
-        x_key, y_key = _top_left_from_quad(quad)
-        cells.append(
-            {
-                "polygon": quad,
-                "x_key": x_key,
-                "y_key": y_key,
-                "row_start": ns,
-                "row_end": ne,
-                "col_start": cs,
-                "col_end": ce,
-                "row_span": ne - ns + 1,
-                "col_span": ce - cs + 1,
-                "texts": [],
-                "text": "",
-            }
-        )
-
-    cells = _correct_columns_by_physical_x(cells, cluster_thresh=15.0)
-    return _correct_rows_by_physical_y(cells)
-
-
-def _run_engine(engine: Any, image: np.ndarray) -> Any:
-    """调用 TSR 引擎；优先 need_ocr=False，兼容空 ocr_result。"""
-    try:
-        return engine(image, need_ocr=False)
-    except TypeError:
-        pass
-    try:
-        return engine(image, ocr_result=[], need_ocr=False)
-    except Exception:
-        return engine(image, ocr_result=[])
-
-
 def _classify_table(table_cls: Any, image: np.ndarray) -> str:
     """返回 'wired' 或 'lineless'。"""
     cls_out, _elapse = table_cls(image)
     label = str(cls_out).strip().lower()
     if label in {"wired", "wire", "有线"}:
         return "wired"
-    # wireless / lineless / 其它 → 无线
     return "lineless"
 
 
-def _predict_kind(
+def text_boxes_to_ocr_result(
+    text_boxes: List[Dict[str, Any]],
+    *,
+    scale: float = 1.0,
+) -> List[Tuple[Any, str, float]]:
+    """
+    将云端 PaddleOCR text_boxes 转为 TableStructureRec 的 ocr_result 格式。
+
+    ocr_result: [(box, text, score), ...]，box 为 4 点坐标列表。
+    scale: 将原图坐标缩放到 TSR 推理图坐标（_maybe_downscale 的 scale）。
+    """
+    out: List[Tuple[Any, str, float]] = []
+    for tb in text_boxes or []:
+        poly = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if poly.shape[0] < 4:
+            continue
+        if abs(scale - 1.0) > 1e-9:
+            poly = poly * float(scale)
+        box = poly[:4].tolist()
+        text = str(tb.get("text") or "")
+        score = float(tb.get("score", 1.0) or 1.0)
+        out.append((box, text, score))
+    return out
+
+
+def _run_engine_with_ocr(
     engine: Any,
-    infer_img: np.ndarray,
-    scale: float,
-    *,
-    kind_label: str,
-) -> List[Dict[str, Any]]:
-    result = _run_engine(engine, infer_img)
-    cell_bboxes = getattr(result, "cell_bboxes", None)
-    logic_points = getattr(result, "logic_points", None)
-    elapse = getattr(result, "elapse", None)
-    n = 0 if cell_bboxes is None else len(cell_bboxes)
-    if elapse is not None:
-        logger.info("TSR %s 耗时 %.3fs，cells=%s", kind_label, float(elapse), n)
-    else:
-        logger.info("TSR %s cells=%s", kind_label, n)
-    return _result_to_cells(cell_bboxes, logic_points, scale=scale)
-
-
-def _pick_finer_grid(
-    primary: List[Dict[str, Any]],
-    alt: List[Dict[str, Any]],
-    text_boxes: Optional[List[Dict[str, Any]]],
-    *,
-    primary_label: str,
-    alt_label: str,
-    hybrid: bool,
-) -> List[Dict[str, Any]]:
-    """按结构质量（列/行/格数相对 OCR）选型，避免大格假覆盖或过切毁掉后处理。"""
-    from .tsr_refine import (
-        cell_grid_stats,
-        coverage_score,
-        looks_oversegmented,
-        looks_undersegmented,
-        structure_quality_score,
-    )
-
-    boxes = text_boxes or []
-    p_cols, p_rows, p_n = cell_grid_stats(primary)
-    a_cols, a_rows, a_n = cell_grid_stats(alt)
-    score_p = coverage_score(primary, boxes)
-    score_a = coverage_score(alt, boxes)
-    q_p = structure_quality_score(primary, boxes)
-    q_a = structure_quality_score(alt, boxes)
-    alt_under = bool(boxes) and looks_undersegmented(alt, boxes)
-    pri_under = bool(boxes) and looks_undersegmented(primary, boxes)
-    alt_over = bool(boxes) and looks_oversegmented(alt, boxes)
-    pri_over = bool(boxes) and looks_oversegmented(primary, boxes)
-
-    logger.info(
-        "TSR 对照 %s vs %s: cols=%d/%d rows=%d/%d cells=%d/%d cov=%.3f/%.3f "
-        "qual=%.3f/%.3f hybrid=%s under=%s/%s over=%s/%s",
-        primary_label,
-        alt_label,
-        p_cols,
-        a_cols,
-        p_rows,
-        a_rows,
-        p_n,
-        a_n,
-        score_p,
-        score_a,
-        q_p,
-        q_a,
-        hybrid,
-        pri_under,
-        alt_under,
-        pri_over,
-        alt_over,
-    )
-
-    # 过切候选：除非覆盖率塌了，否则不换过去
-    if alt_over and not pri_over and score_p >= 0.7:
-        logger.info(
-            "TSR 保留 %s（拒绝过切 %s: cols=%d rows=%d cells=%d）",
-            primary_label,
-            alt_label,
-            a_cols,
-            a_rows,
-            a_n,
-        )
-        return primary
-
-    # 主路径覆盖好且列数合理时，拒绝对照列数暴涨（假细切，常见于有线表误切 lineless）
-    n_boxes = len(boxes)
-    if (
-        score_p >= 0.85
-        and not pri_over
-        and p_cols >= 3
-        and a_cols >= max(int(p_cols * 2.5), p_cols + 8)
-        and a_cols > max(12, n_boxes // 3 if n_boxes else 12)
-    ):
-        logger.info(
-            "TSR 保留 %s（拒绝对照列暴涨: %d→%d, cov=%.3f）",
-            primary_label,
-            p_cols,
-            a_cols,
-            score_p,
-        )
-        return primary
-
-    # 双方都过切时：行数已接近 OCR 期望的一侧更稳（避免 lineless 暴增行
-    # 再被 ghost-merge 压成几行巨格，如窄高多行表）
-    if n_boxes >= 24 and pri_over and alt_over:
-        row_floor = max(8, n_boxes // 12)
-        if (
-            p_rows >= row_floor
-            and a_rows > p_rows * 1.75
-            and score_p >= 0.62
-        ):
-            logger.info(
-                "TSR 保留 %s（双方过切，行数更合理: %d vs %d，目标≥%d）",
-                primary_label,
-                p_rows,
-                a_rows,
-                row_floor,
-            )
-            return primary
-        if (
-            a_rows >= row_floor
-            and p_rows > a_rows * 1.75
-            and score_a >= 0.62
-        ):
-            logger.info(
-                "TSR 选用 %s（双方过切，行数更合理: %d→%d，目标≥%d）",
-                alt_label,
-                p_rows,
-                a_rows,
-                row_floor,
-            )
-            return alt
-
-    # 主路径过切、对照不过切 → 换到对照（即使列更少）
-    if pri_over and not alt_over and score_a >= score_p - 0.08:
-        logger.info(
-            "TSR 选用 %s（主路径过切，对照更稳: qual %.3f→%.3f）",
-            alt_label,
-            q_p,
-            q_a,
-        )
-        return alt
-
-    # 拒绝明显更粗的网格（大格假高覆盖是挤格主因）
-    if a_cols + 2 <= p_cols and not pri_under and not pri_over:
-        logger.info(
-            "TSR 保留 %s（拒绝更粗 %s: cols %d→%d）",
-            primary_label,
-            alt_label,
-            p_cols,
-            a_cols,
-        )
-        return primary
-    if alt_under and not pri_under and a_n < p_n * 0.7 and not pri_over:
-        logger.info(
-            "TSR 保留 %s（拒绝欠切 %s: cells %d→%d）",
-            primary_label,
-            alt_label,
-            p_n,
-            a_n,
-        )
-        return primary
-
-    # 结构质量分明显更高
-    if q_a > q_p + 0.04 and score_a >= score_p - 0.08:
-        logger.info(
-            "TSR 选用 %s（结构质量更优: %.3f→%.3f）",
-            alt_label,
-            q_p,
-            q_a,
-        )
-        return alt
-
-    # 覆盖率明显更优，且不是拿欠切换细切 / 过切
-    if score_a > score_p + 0.05 and not alt_under and not alt_over:
-        logger.info("TSR 选用 %s（覆盖率更优）", alt_label)
-        return alt
-
-    # 列更细且未过切：允许覆盖率略低，但结构质量不能明显更差
-    cov_slack = 0.10 if (hybrid or pri_under) else 0.05
-    if (
-        a_cols >= p_cols + 2
-        and not alt_over
-        and score_a >= score_p - cov_slack
-        and q_a >= q_p - 0.04
-    ):
-        logger.info(
-            "TSR 选用 %s（列更细: %d→%d, cov %.3f→%.3f）",
-            alt_label,
-            p_cols,
-            a_cols,
-            score_p,
-            score_a,
-        )
-        return alt
-    if (
-        (hybrid or pri_under)
-        and a_cols > p_cols
-        and not alt_over
-        and score_a >= score_p - cov_slack
-        and q_a >= q_p - 0.04
-    ):
-        logger.info(
-            "TSR 选用 %s（hybrid/欠切 列粒度: %d→%d）",
-            alt_label,
-            p_cols,
-            a_cols,
-        )
-        return alt
-    return primary
-
-
-def predict_cells_tsr(
     image: np.ndarray,
+    ocr_result: List[Tuple[Any, str, float]],
+) -> Any:
+    """调用 TSR 引擎，传入外部 OCR 结果（不使用 RapidOCR）。"""
+    attempts = [
+        {"ocr_result": ocr_result, "need_ocr": True},
+        {"ocr_result": ocr_result},
+        {"ocr_result": ocr_result, "need_ocr": False},
+    ]
+    last_exc: Exception | None = None
+    for kwargs in attempts:
+        try:
+            return engine(image, **kwargs)
+        except TypeError as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    return engine(image, ocr_result=ocr_result)
+
+
+def predict_table_html(
+    image: np.ndarray,
+    text_boxes: List[Dict[str, Any]],
     *,
     table_cls=None,
     wired_engine=None,
     lineless_engine=None,
     force_kind: Optional[str] = None,
-    text_boxes: Optional[List[Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[Any, float]:
     """
-    用 TableStructureRec 预测单元格物理框 + 逻辑拓扑。
+    用 TableStructureRec 预测表格 HTML（pred_html）。
 
-    Args:
-        force_kind: None 时用 table_cls；也可强制 "wired" / "lineless"
-        text_boxes: 若提供，则按覆盖率/列粒度在 wired↔lineless 间纠偏。
-            混合表（竖多横少）或欠切时会对称探测，避免锁死有线大格。
+    Returns:
+        (WiredTableOutput | LinelessTableOutput, infer_scale)
     """
-    from .tsr_refine import (
-        coverage_score,
-        is_hybrid_line_table,
-        line_density_axes,
-        looks_fully_wired,
-        looks_undersegmented,
-    )
-
     cls_eng, wired, lineless = load_tsr_models()
     table_cls = table_cls or cls_eng
     wired_engine = wired_engine or wired
@@ -423,192 +142,143 @@ def predict_cells_tsr(
     kind = (force_kind or _classify_table(table_cls, infer_img)).strip().lower()
     if kind not in {"wired", "lineless"}:
         kind = "lineless"
-    h_dens, v_dens = line_density_axes(image)
-    dens = h_dens + v_dens
-    hybrid = is_hybrid_line_table(h_dens, v_dens)
-    fully_wired = looks_fully_wired(h_dens, v_dens)
 
-    if force_kind:
-        engine = wired_engine if kind == "wired" else lineless_engine
-        logger.info(
-            "TSR 路径: %s (forced), h=%.4f v=%.4f dens=%.4f hybrid=%s",
-            kind,
-            h_dens,
-            v_dens,
-            dens,
-            hybrid,
+    engine = wired_engine if kind == "wired" else lineless_engine
+    ocr_result = text_boxes_to_ocr_result(text_boxes, scale=scale)
+    logger.info("TSR 路径: %s，ocr_boxes=%d", kind, len(ocr_result))
+
+    result = _run_engine_with_ocr(engine, infer_img, ocr_result)
+    elapse = getattr(result, "elapse", None)
+    n_cells = 0
+    cell_bboxes = getattr(result, "cell_bboxes", None)
+    if cell_bboxes is not None:
+        n_cells = len(cell_bboxes)
+    if elapse is not None:
+        logger.info("TSR %s 耗时 %.3fs，cells=%d", kind, float(elapse), n_cells)
+    else:
+        logger.info("TSR %s cells=%d", kind, n_cells)
+    return result, scale
+
+
+_TABLE_BORDER_STYLE = """<meta charset="UTF-8">
+<style>
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+th, td {
+    border: 1px solid #000;
+    padding: 4px 8px;
+    text-align: center;
+    vertical-align: middle;
+}
+</style>"""
+
+
+def _inject_table_border_style(html: str) -> str:
+    """为 pred_html 注入表格边框样式（对齐 VisTable.insert_border_style）。"""
+    if not html or "border-collapse" in html:
+        return html
+    import re
+
+    if re.search(r"<head\b", html, re.I):
+        return re.sub(
+            r"(<head[^>]*>)",
+            rf"\1\n{_TABLE_BORDER_STYLE}\n",
+            html,
+            count=1,
+            flags=re.I,
         )
-        return _predict_kind(engine, infer_img, scale, kind_label=kind)
-
-    primary_kind = kind
-    # 仅当横竖都够密且非 hybrid 时，才额外探测 wired；最终仍按列粒度选型
-    prefer_wired_probe = primary_kind != "wired" and fully_wired and not hybrid
-
-    if primary_kind == "wired":
-        logger.info(
-            "TSR 路径: wired (unet) primary, h=%.4f v=%.4f dens=%.4f hybrid=%s",
-            h_dens,
-            v_dens,
-            dens,
-            hybrid,
+    if re.search(r"<body\b", html, re.I):
+        return re.sub(
+            r"(<body[^>]*>)",
+            rf"\1\n{_TABLE_BORDER_STYLE}\n",
+            html,
+            count=1,
+            flags=re.I,
         )
-        cells = _predict_kind(wired_engine, infer_img, scale, kind_label="wired")
-        boxes = text_boxes or []
-        cov = coverage_score(cells, boxes) if boxes else 1.0
-        underseg = bool(boxes) and looks_undersegmented(cells, boxes)
-        should_probe = bool(boxes) and (hybrid or underseg or cov < 0.45)
-        if should_probe:
-            alt = _predict_kind(
-                lineless_engine, infer_img, scale, kind_label="lineless"
-            )
-            chosen = _pick_finer_grid(
-                cells,
-                alt,
-                text_boxes,
-                primary_label="wired",
-                alt_label="lineless",
-                hybrid=hybrid or underseg,
-            )
-            logger.info(
-                "TSR 最终: %s (primary=wired hybrid=%s underseg=%s)",
-                "lineless" if chosen is alt else "wired",
-                hybrid,
-                underseg,
-            )
-            return chosen
-        logger.info(
-            "TSR 最终: wired (cells=%d cov=%.3f, 未探测 lineless)",
-            len(cells),
-            cov,
-        )
-        return cells
-
-    logger.info(
-        "TSR 路径: lineless (lore) primary, h=%.4f v=%.4f dens=%.4f hybrid=%s fully_wired=%s",
-        h_dens,
-        v_dens,
-        dens,
-        hybrid,
-        fully_wired,
-    )
-    cells = _predict_kind(lineless_engine, infer_img, scale, kind_label="lineless")
-    boxes = text_boxes or []
-    cov = coverage_score(cells, boxes) if boxes else 1.0
-    underseg = bool(boxes) and looks_undersegmented(cells, boxes)
-    if prefer_wired_probe or (boxes and (cov < 0.55 or underseg)):
-        alt = _predict_kind(wired_engine, infer_img, scale, kind_label="wired")
-        # 一律走列粒度选型；禁止仅凭覆盖率把细切换成欠切大格
-        chosen = _pick_finer_grid(
-            cells,
-            alt,
-            text_boxes,
-            primary_label="lineless",
-            alt_label="wired",
-            hybrid=hybrid or underseg,
-        )
-        logger.info(
-            "TSR 最终: %s (primary=lineless hybrid=%s underseg=%s)",
-            "wired" if chosen is alt else "lineless",
-            hybrid,
-            underseg,
-        )
-        return chosen
-    logger.info("TSR 最终: lineless (cells=%d cov=%.3f)", len(cells), cov)
-    return cells
+    return f"{_TABLE_BORDER_STYLE}\n{html}"
 
 
-def cells_to_debug_table(cells: List[Dict[str, Any]]) -> Any:
-    """将 cell 列表包装为 DetectedTable，供 debug 叠加图使用。"""
-    from .lines import DetectedTable
-
-    if not cells:
-        return DetectedTable(
-            cells=[],
-            bbox=(0, 0, 1, 1),
-            row_seps=[],
-            col_seps=[],
-            confidence=1.0,
-        )
-
-    xs: List[float] = []
-    ys: List[float] = []
-    for cell in cells:
-        poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
-        xs.extend(poly[:, 0].tolist())
-        ys.extend(poly[:, 1].tolist())
-    x1, y1 = int(np.floor(min(xs))), int(np.floor(min(ys)))
-    x2, y2 = int(np.ceil(max(xs))), int(np.ceil(max(ys)))
-    return DetectedTable(
-        cells=list(cells),
-        bbox=(x1, y1, x2, y2),
-        row_seps=[],
-        col_seps=[],
-        confidence=1.0,
+def wrap_pred_html(html: Optional[str]) -> str:
+    """补全 pred_html 文档壳，并注入表格边框 CSS。"""
+    if not html:
+        return ""
+    s = str(html).strip()
+    if not s:
+        return ""
+    lower = s.lower()
+    if "<html" in lower:
+        if "<head" not in lower and "<body" in lower:
+            s = s.replace("<html>", "<html>\n<head>\n</head>\n", 1)
+            s = s.replace("<HTML>", "<html>\n<head>\n</head>\n", 1)
+        s = _inject_table_border_style(s)
+        if "<!doctype" not in lower:
+            return f"<!DOCTYPE html>\n{s}"
+        return s
+    if "<body" in lower:
+        s = _inject_table_border_style(s)
+        return f"<!DOCTYPE html>\n<html>\n{s}\n</html>"
+    s = _inject_table_border_style(s)
+    return (
+        f"<!DOCTYPE html>\n<html>\n<head>\n{_TABLE_BORDER_STYLE}\n</head>\n"
+        f"<body>\n{s}\n</body>\n</html>"
     )
 
 
-def _cells_to_draw_list(
-    cells: Optional[List[Dict[str, Any]]] = None,
-    tables: Optional[List[Any]] = None,
-) -> List[Dict[str, Any]]:
-    if cells:
-        return list(cells)
-    out: List[Dict[str, Any]] = []
-    for table in tables or []:
-        out.extend(getattr(table, "cells", None) or [])
-    return out
+def _iter_cell_bboxes(tsr_result: Any) -> List[Any]:
+    """安全取出 cell_bboxes（避免 numpy 数组做布尔判断）。"""
+    cell_bboxes = getattr(tsr_result, "cell_bboxes", None)
+    if cell_bboxes is None:
+        return []
+    arr = np.asarray(cell_bboxes)
+    if arr.size == 0:
+        return []
+    if arr.ndim == 1:
+        return [arr]
+    return [arr[i] for i in range(len(arr))]
 
 
-def render_table_vis(
+def _render_vis_fallback(
     image: np.ndarray,
-    cells: Optional[List[Dict[str, Any]]] = None,
-    tables: Optional[List[Any]] = None,
+    tsr_result: Any,
     *,
     colorful: bool = True,
 ) -> np.ndarray:
-    """TableStructureRec VisTable / vis_table：在原图上描单元格框线。
-
-    colorful=True 时每个单元格用随机颜色描边（库内 vis_table）；
-    False 时统一蓝色（VisTable.draw_polylines）。
-    """
+    """VisTable 不可用时的简单框线可视化。"""
     import random
 
-    draw_cells = _cells_to_draw_list(cells, tables)
     if image.ndim == 2:
         canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     else:
         canvas = image.copy()
 
-    for i, cell in enumerate(draw_cells):
-        poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
-        poly_i = np.round(poly).astype(np.int32)
+    for i, box in enumerate(_iter_cell_bboxes(tsr_result)):
+        arr = np.asarray(box, dtype=np.float64).reshape(-1)
+        if arr.size == 4:
+            x1, y1, x2, y2 = arr.tolist()
+            poly_i = np.array(
+                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                dtype=np.int32,
+            )
+        elif arr.size >= 8:
+            poly_i = np.round(arr[:8].reshape(4, 2)).astype(np.int32)
+        else:
+            continue
         if colorful:
             rng = random.Random(i * 9973 + 17)
             color = (rng.randint(32, 255), rng.randint(32, 255), rng.randint(32, 255))
         else:
-            color = (255, 0, 0)  # BGR 蓝，对齐 VisTable
+            color = (255, 0, 0)
         cv2.polylines(canvas, [poly_i], True, color, 2)
-        if colorful:
-            cv2.putText(
-                canvas,
-                str(i),
-                (int(poly_i[0, 0]), int(poly_i[0, 1])),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 0, 255),
-                1,
-                cv2.LINE_AA,
-            )
     return canvas
 
 
-def render_table_vis_logic(
+def _render_vis_logic_fallback(
     image: np.ndarray,
-    cells: Optional[List[Dict[str, Any]]] = None,
-    tables: Optional[List[Any]] = None,
+    tsr_result: Any,
 ) -> np.ndarray:
-    """对齐 TableStructureRec VisTable.plot_rec_box_with_logic_info：框 + row/col 标注。"""
-    draw_cells = _cells_to_draw_list(cells, tables)
+    """VisTable 不可用时的逻辑行列标注图。"""
     if image.ndim == 2:
         canvas = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     else:
@@ -617,35 +287,104 @@ def render_table_vis_logic(
         canvas, 0, 0, 0, 100, cv2.BORDER_CONSTANT, value=[255, 255, 255]
     )
 
-    for cell in draw_cells:
-        poly = np.asarray(cell["polygon"], dtype=np.float64).reshape(-1, 2)
-        x0 = int(round(float(poly[:, 0].min())))
-        y0 = int(round(float(poly[:, 1].min())))
-        x1 = int(round(float(poly[:, 0].max())))
-        y1 = int(round(float(poly[:, 1].max())))
-        cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 0, 255), 1)
-        rs = cell.get("row_start", 0)
-        re = cell.get("row_end", rs)
-        cs = cell.get("col_start", 0)
-        ce = cell.get("col_end", cs)
-        cv2.putText(
-            canvas,
-            f"row: {rs}-{re}",
-            (x0 + 3, y0 + 12),
-            cv2.FONT_HERSHEY_PLAIN,
-            0.9,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            canvas,
-            f"col: {cs}-{ce}",
-            (x0 + 3, y0 + 24),
-            cv2.FONT_HERSHEY_PLAIN,
-            0.9,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA,
-        )
+    logic_points = getattr(tsr_result, "logic_points", None)
+    logics: List[Any] = []
+    if logic_points is not None:
+        lp = np.asarray(logic_points)
+        if lp.size > 0:
+            logics = [lp[i] for i in range(len(lp))]
+
+    for i, box in enumerate(_iter_cell_bboxes(tsr_result)):
+        arr = np.asarray(box, dtype=np.float64).reshape(-1)
+        if arr.size == 4:
+            x0, y0, x1, y1 = arr.tolist()
+        elif arr.size >= 8:
+            pts = arr[:8].reshape(4, 2)
+            x0, y0 = float(pts[:, 0].min()), float(pts[:, 1].min())
+            x1, y1 = float(pts[:, 0].max()), float(pts[:, 1].max())
+        else:
+            continue
+        x0_i, y0_i, x1_i, y1_i = map(int, map(round, (x0, y0, x1, y1)))
+        cv2.rectangle(canvas, (x0_i, y0_i), (x1_i, y1_i), (0, 0, 255), 1)
+        if i < len(logics):
+            logi = np.asarray(logics[i], dtype=np.float64).reshape(-1)
+            if logi.size >= 4:
+                rs, re, cs, ce = [int(round(float(x))) for x in logi[:4]]
+                cv2.putText(
+                    canvas,
+                    f"row: {rs}-{re}",
+                    (x0_i + 3, y0_i + 12),
+                    cv2.FONT_HERSHEY_PLAIN,
+                    0.9,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    canvas,
+                    f"col: {cs}-{ce}",
+                    (x0_i + 3, y0_i + 24),
+                    cv2.FONT_HERSHEY_PLAIN,
+                    0.9,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
     return canvas
+
+
+def save_tsr_vis(
+    image: np.ndarray,
+    tsr_result: Any,
+    stem: str,
+    out_dir: Path | str,
+) -> List[str]:
+    """写出表格可视化图（优先 VisTable，失败则回退 OpenCV 描框）。"""
+    from ..utils.image_io import imwrite_unicode
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vis_paths: List[str] = []
+
+    draw_path = out_dir / f"{stem}_table_vis.png"
+    logic_path = out_dir / f"{stem}_table_vis_logic.png"
+
+    try:
+        from wired_table_rec.utils.utils import VisTable
+
+        # VisTable 内部用 cv2.imread/imwrite，临时路径必须是纯 ASCII
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            img_path = tmp_path / "input.png"
+            html_path = tmp_path / "table.html"
+            draw_tmp = tmp_path / "table_vis.png"
+            logic_tmp = tmp_path / "table_vis_logic.png"
+            if not imwrite_unicode(str(img_path), image):
+                raise RuntimeError("无法写入临时图像")
+            viser = VisTable()
+            viser(
+                str(img_path),
+                tsr_result,
+                str(html_path),
+                str(draw_tmp),
+                str(logic_tmp),
+            )
+            if draw_tmp.is_file():
+                draw_path.write_bytes(draw_tmp.read_bytes())
+                vis_paths.append(str(draw_path))
+            if logic_tmp.is_file():
+                logic_path.write_bytes(logic_tmp.read_bytes())
+                vis_paths.append(str(logic_path))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("VisTable 失败，回退 OpenCV 描框: %s", exc)
+        vis_img = _render_vis_fallback(image, tsr_result, colorful=True)
+        if imwrite_unicode(str(draw_path), vis_img):
+            vis_paths.append(str(draw_path))
+        logic_img = _render_vis_logic_fallback(image, tsr_result)
+        if imwrite_unicode(str(logic_path), logic_img):
+            vis_paths.append(str(logic_path))
+
+    for p in vis_paths:
+        logger.info("表格可视化已写入: %s", p)
+        print(f"[info] 表格划线图: {p}")
+    return vis_paths

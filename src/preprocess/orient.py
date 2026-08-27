@@ -275,34 +275,15 @@ def _structure_grid_score(
     orig_landscape: bool = False,
 ) -> float:
     """轻量线网格结构分（越高越好），用于 0°/90° 投票。"""
-    from ..structure.lines import detect_tables
-    from ..structure.tsr_refine import logic_conflict_ratio
-
-    tables = detect_tables(image)
-    if not tables:
-        return -50.0
-    table = max(tables, key=lambda t: t.confidence)
-    cells = table.cells
-    if not cells:
-        return -40.0
-
-    n_rows = len(table.row_seps) - 1 if len(table.row_seps) >= 2 else 1
-    n_cols = len(table.col_seps) - 1 if len(table.col_seps) >= 2 else 1
-    score = float(table.confidence) * 20.0
-    score -= logic_conflict_ratio(cells) * 80.0
-    score += min(len(cells), 300) * 0.05
-
     ih, iw = image.shape[:2]
-    if orig_landscape and iw > ih * 1.1:
-        if n_cols > n_rows * 1.25:
-            score += 18.0
-        elif n_rows > n_cols * 1.25:
-            score -= 22.0
-    elif n_rows > n_cols:
-        score += 6.0
-
     hs, vs = _grid_line_strengths(image)
-    if hs >= vs * 0.55 and hs > 0.004:
+    score = (hs + vs) * 100.0
+    if orig_landscape and iw > ih * 1.1:
+        if hs >= vs * 0.55 and hs > 0.004:
+            score += 12.0
+        elif vs > hs * 1.25:
+            score -= 10.0
+    elif hs >= vs * 0.55 and hs > 0.004:
         score += 6.0
     return score
 
@@ -359,7 +340,7 @@ def ensure_upright_axis(
     use_cache: bool = True,
     refresh_cache: bool = False,
     score_thresh: float = 0.55,
-    cache_extra_base: str = "deskew=1|orient=0",
+    cache_extra_base: str = "orient=0",
 ) -> Tuple[np.ndarray, int, list]:
     """
     若当前 OCR 结果像侧躺，则试转 90° 并取质更好者。
@@ -516,7 +497,7 @@ def maybe_flip_180_by_ocr(
     use_cache: bool = True,
     refresh_cache: bool = False,
     score_thresh: float = 0.55,
-    cache_extra_base: str = "deskew=1|orient",
+    cache_extra_base: str = "orient",
 ) -> Tuple[np.ndarray, int, list]:
     """
     根据已有 OCR 结果决定是否再转 180°；需要时重跑 OCR。

@@ -114,13 +114,6 @@ class Settings:
         self.markdown_ignore_labels: list[str] = _as_csv_list(
             os.getenv("PADDLEOCR_MARKDOWN_IGNORE_LABELS")
         )
-        self.reocr: bool = _as_bool(os.getenv("REOCR"), False)
-        self.reocr_max_cells: int = int(
-            _as_float(os.getenv("REOCR_MAX_CELLS"), 24.0)
-        )
-        self.tsr_aggressive: bool = _as_bool(
-            os.getenv("TSR_AGGRESSIVE"), False
-        )
 
     def require_token(self) -> str:
         if not self.access_token or self.access_token == "your-access-token-here":
