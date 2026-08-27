@@ -15,9 +15,12 @@ import numpy as np
 
 from ..utils.label_patterns import (
     are_independent_row_labels,
+    are_stacked_row_tags,
     expand_slash_example_labels,
     is_independent_row_label,
     is_index_column,
+    is_row_tag_text,
+    should_split_stacked_row_labels,
 )
 
 logger = logging.getLogger(__name__)
@@ -1940,7 +1943,7 @@ def split_false_isolated_body_rowspans(
                     ok = False
                     break
                 row_texts.append(str(by_row[r][0].get("text") or "").strip())
-            if ok and are_independent_row_labels(row_texts):
+            if ok and should_split_stacked_row_labels(row_texts):
                 out.append(cell)
                 continue
 
@@ -2022,6 +2025,92 @@ def _row_groups_for_stacked_labels(
     return groups
 
 
+def _vertically_separated_compact_boxes(
+    cell: Dict[str, Any],
+    boxes: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """从 rowspan 格提取竖向可分的紧凑 OCR 框（几何优先，阈值由框高分布推导）。"""
+    contained = _texts_in_cell(cell, boxes)
+    if len(contained) < 2:
+        return [], []
+    _cx1, cy1, _cx2, cy2 = _cell_bbox(cell)
+    cell_h = max(cy2 - cy1, 1.0)
+    compact: List[Dict[str, Any]] = []
+    for tb in contained:
+        _x1, y1, _x2, y2 = _tb_bbox(tb)
+        if (y2 - y1) > 0.55 * cell_h:
+            continue
+        compact.append(tb)
+    if len(compact) < 2:
+        return [], []
+    compact.sort(key=lambda tb: _tb_bbox(tb)[1])
+    heights = [_tb_bbox(tb)[3] - _tb_bbox(tb)[1] for tb in compact]
+    median_h = float(np.median(heights)) if heights else 1.0
+    cy = [(_tb_bbox(tb)[1] + _tb_bbox(tb)[3]) / 2.0 for tb in compact]
+    gap_thresh = max(3.0, 0.35 * median_h)
+    for i in range(len(cy) - 1):
+        if cy[i + 1] - cy[i] < gap_thresh:
+            return [], []
+    texts = [str(tb.get("text") or "").strip() for tb in compact]
+    return compact, texts
+
+
+def _extract_stacked_row_labels(
+    cell: Dict[str, Any],
+    boxes: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """从 rowspan 格收集应拆开的叠放行标签（几何优先，语义校验）。"""
+    geo_boxes, geo_texts = _vertically_separated_compact_boxes(cell, boxes)
+    if len(geo_boxes) >= 2 and should_split_stacked_row_labels(geo_texts):
+        return geo_boxes, geo_texts
+
+    contained = _texts_in_cell(cell, boxes)
+    label_boxes: List[Dict[str, Any]] = []
+    texts: List[str] = []
+
+    for tb in contained:
+        t = str(tb.get("text") or "").strip()
+        if not t:
+            continue
+        expanded = expand_slash_example_labels(t)
+        if len(expanded) >= 2 and are_stacked_row_tags(
+            [re.sub(r"\s+", "", x) for x in expanded]
+        ):
+            for part in expanded:
+                label_boxes.append(tb)
+                texts.append(part)
+        elif is_row_tag_text(t):
+            label_boxes.append(tb)
+            texts.append(t)
+
+    if len(label_boxes) >= 2:
+        pairs = sorted(zip(label_boxes, texts), key=lambda p: _tb_bbox(p[0])[1])
+        lb = [p[0] for p in pairs]
+        tx = [p[1] for p in pairs]
+        if should_split_stacked_row_labels(tx):
+            return lb, tx
+
+    raw = cell.get("text")
+    if isinstance(raw, (list, tuple)):
+        parts = [str(x).strip() for x in raw if str(x).strip()]
+    elif raw is not None and not isinstance(raw, str):
+        parts = []
+    else:
+        expanded = expand_slash_example_labels(str(raw or ""))
+        if len(expanded) >= 2:
+            parts = expanded
+        else:
+            parts = [
+                p.strip()
+                for p in re.split(r"[\n/]+", str(raw or ""))
+                if p.strip()
+            ]
+    if len(parts) >= 2 and should_split_stacked_row_labels(parts):
+        return [], parts
+
+    return [], []
+
+
 def split_stacked_left_example_rowspans(
     cells: List[Dict[str, Any]],
     boxes: Sequence[Dict[str, Any]],
@@ -2029,9 +2118,9 @@ def split_stacked_left_example_rowspans(
     max_left_col: int = 1,
     min_rowspan: int = 2,
 ) -> List[Dict[str, Any]]:
-    """左列 rowspan 内叠放多个实施例/比较例标签 → 按 y 带拆成多格。
+    """左列 rowspan 内叠放多个行标签（实施例/样品代号等）→ 按 y 带拆成多格。
 
-    典型：実施例26/27/28 被 TSR 合成一格 rowspan=6，邻列已按子行切分。
+    典型：実施例26/27/28 或 No 列 P-33/P-34 被 TSR 合成一格 rowspan，邻列已按子行切分。
     """
     if not cells or not boxes:
         return cells
@@ -2058,58 +2147,16 @@ def split_stacked_left_example_rowspans(
             out.append(cell)
             continue
         rs, re_ = int(cell["row_start"]), int(cell["row_end"])
-        if re_ < body_start:
+        label_boxes, texts = _extract_stacked_row_labels(cell, boxes)
+        # 完全落在表头带内、且无叠放行标 → 跳过；跨表头+表体的左列 rowspan 仍须拆
+        if re_ < body_start and not should_split_stacked_row_labels(texts):
+            out.append(cell)
+            continue
+        if len(texts) < 2:
             out.append(cell)
             continue
 
-        contained = _texts_in_cell(cell, boxes)
-        label_boxes: List[Dict[str, Any]] = []
-        texts = []
-        for tb in contained:
-            t = str(tb.get("text") or "").strip()
-            if not t or not _STACKED_EXAMPLE_LABEL_RE.search(t):
-                continue
-            expanded = expand_slash_example_labels(t)
-            if len(expanded) >= 2 and are_independent_row_labels(
-                [re.sub(r"\s+", "", x) for x in expanded]
-            ):
-                for part in expanded:
-                    label_boxes.append(tb)
-                    texts.append(part)
-            elif is_independent_row_label(t):
-                label_boxes.append(tb)
-                texts.append(t)
-        if len(label_boxes) < 2:
-            raw = cell.get("text")
-            if isinstance(raw, (list, tuple)):
-                parts = [str(x).strip() for x in raw if str(x).strip()]
-            elif raw is not None and not isinstance(raw, str):
-                parts = []
-            else:
-                expanded = expand_slash_example_labels(str(raw or ""))
-                if len(expanded) >= 2:
-                    parts = expanded
-                else:
-                    parts = [
-                        p.strip()
-                        for p in re.split(r"[\n/]+", str(raw or ""))
-                        if p.strip()
-                    ]
-            if len(parts) >= 2 and are_independent_row_labels(parts):
-                texts = parts
-                label_boxes = []
-            else:
-                out.append(cell)
-                continue
-        else:
-            # 按 y 排序并保持 texts 与 label_boxes 对齐
-            pairs = sorted(
-                zip(label_boxes, texts), key=lambda p: _tb_bbox(p[0])[1]
-            )
-            label_boxes = [p[0] for p in pairs]
-            texts = [p[1] for p in pairs]
-
-        if not texts or not are_independent_row_labels(texts):
+        if not should_split_stacked_row_labels(texts):
             out.append(cell)
             continue
 
@@ -2182,13 +2229,19 @@ def _stacked_body_parts(
                 re.fullmatch(r"[A-Za-z][A-Za-z0-9\-＋+]*", p) and len(p) <= 14
                 for p in parts
             ):
-                return parts
-        if len(parts) >= 2:
+                if _parts_are_stackable_data(parts):
+                    return parts
+        if len(parts) >= 2 and _parts_are_stackable_data(parts):
             return parts
+    geo_boxes, geo_texts = _vertically_separated_compact_boxes(cell, boxes)
+    if len(geo_texts) >= 2 and _parts_are_stackable_data(geo_texts):
+        return geo_texts
     contained = _texts_in_cell(cell, boxes)
     if len(contained) >= 2:
         contained = sorted(contained, key=lambda tb: _tb_bbox(tb)[1])
-        return [str(tb.get("text") or "").strip() for tb in contained]
+        parts = [str(tb.get("text") or "").strip() for tb in contained]
+        if _parts_are_stackable_data(parts):
+            return parts
     return []
 
 
@@ -2220,9 +2273,9 @@ def split_multiline_rowspan_cells(
     boxes: Sequence[Dict[str, Any]],
     *,
     min_rowspan: int = 2,
-    min_left_col: int = 2,
+    min_left_col: int = 1,
 ) -> List[Dict[str, Any]]:
-    """表体高 rowspan 格内多行数据（C-7/C-5、E/C/B 等级）→ 按 y 带拆成子格。"""
+    """表体高 rowspan 格内多行数据（BPDA/BPDA、C-7/C-5 等）→ 按 y 带拆成子格。"""
     if not cells or not boxes:
         return cells
     row_seps, col_seps = _derive_seps(cells)
@@ -2398,7 +2451,7 @@ def align_full_rowspans_to_subgrid(
         rs, re_ = int(cell["row_start"]), int(cell["row_end"])
         key = (rs, re_)
         stripes = stripe_map.get(key)
-        if not stripes or re_ - rs + 1 <= len(stripes):
+        if not stripes:
             continue
         cs, ce = int(cell["col_start"]), int(cell["col_end"])
         x1 = float(col_seps[cs]) if cs < len(col_seps) else _cell_bbox(cell)[0]
@@ -2411,6 +2464,9 @@ def align_full_rowspans_to_subgrid(
         text = str(cell.get("text") or "").strip()
         parts = _stacked_body_parts(cell, boxes)
         use_parts = parts if len(parts) == len(stripes) else []
+        # 多段叠放数据与子行带对齐 → 须切开（即使 rowspan 已等于子行数）
+        if len(use_parts) < 2 and re_ - rs + 1 <= len(stripes):
+            continue
 
         for i, (s, e) in enumerate(stripes):
             y_lo = float(row_seps[s])
@@ -2842,7 +2898,18 @@ def _body_header_bounds(
     header_end = 0
     for c in cells:
         rs, re_ = int(c["row_start"]), int(c["row_end"])
+        cs = int(c.get("col_start") or 0)
         if rs <= 1 and re_ > rs:
+            # 左列缺内横线时序号会被合成超高 rowspan；若邻列在同带内已有原子行则非表头
+            if cs == 0:
+                has_atomic_neighbors = any(
+                    int(o.get("col_start") or 0) > 0
+                    and int(o["row_start"]) == int(o["row_end"])
+                    and rs <= int(o["row_start"]) <= re_
+                    for o in cells
+                )
+                if has_atomic_neighbors:
+                    continue
             header_end = max(header_end, re_)
     if header_end < 1:
         header_end = min(2, max(0, max_row // 4))
@@ -3147,7 +3214,7 @@ def split_underspanned_rows(
             if not (y0 <= my < y1 or (r == n_rows - 1 and y0 <= my <= y1)):
                 continue
             t = str(tb.get("text") or "").strip()
-            if t and _STACKED_EXAMPLE_LABEL_RE.search(t):
+            if t and is_row_tag_text(t):
                 ys.append(my)
         if len(ys) < 2:
             return False

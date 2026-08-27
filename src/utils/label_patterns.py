@@ -127,6 +127,39 @@ def is_row_index_text(text: str) -> bool:
     return bool(t) and bool(_ROW_INDEX_RE.fullmatch(t))
 
 
+def is_row_tag_text(text: str) -> bool:
+    """单行是否像行标识（序号/样品代号/实施例等），用于叠放 rowspan 几何拆分。"""
+    if is_independent_row_label(text):
+        return True
+    if is_named_row_label(text):
+        return True
+    if is_row_index_text(text):
+        return True
+    t = normalize_spaces(text)
+    if not t or len(t) > 14:
+        return False
+    # 短配方/样品代号（P-33、A-101）；须含数字，避免「No」「BPDA」等表头词误入
+    return looks_like_body_data_token(text) and any(ch.isdigit() for ch in t)
+
+
+def are_stacked_row_tags(texts: Sequence[str]) -> bool:
+    """多行文本是否均为行标识（应拆开 rowspan）。"""
+    cleaned = [normalize_spaces(t) for t in texts if (t or "").strip()]
+    if len(cleaned) < 2:
+        return False
+    return all(is_row_tag_text(t) for t in cleaned)
+
+
+def should_split_stacked_row_labels(texts: Sequence[str]) -> bool:
+    """rowspan 内叠放文本是否应拆开：全为行标，或 ≥2 个行标与表头词混排（如 No + P-33）。"""
+    cleaned = [normalize_spaces(t) for t in texts if (t or "").strip()]
+    if len(cleaned) < 2:
+        return False
+    if are_stacked_row_tags(cleaned):
+        return True
+    return sum(1 for t in cleaned if is_row_tag_text(t)) >= 2
+
+
 def is_index_column(
     texts: Sequence[str],
     *,
@@ -141,7 +174,9 @@ def is_index_column(
     nonempty = [str(t).strip() for t in texts if str(t or "").strip()]
     if len(nonempty) < min_nonempty:
         return False
-    n_idx = sum(1 for t in nonempty if is_row_index_text(t))
+    n_idx = sum(
+        1 for t in nonempty if is_row_index_text(t) or is_row_tag_text(t)
+    )
     return (n_idx / len(nonempty)) >= min_ratio
 
 
