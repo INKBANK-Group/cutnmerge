@@ -12,6 +12,7 @@ import numpy as np
 from .config import ROOT
 from .models import load_ocr, predict_texts
 from ..ocr.ocr_post import postprocess_text_boxes
+from ..ocr.glyph_fix import fix_thin_glyphs
 from ..output.html2md import html_to_markdown
 from ..preprocess.orient import (
     apply_orientation_axis,
@@ -110,6 +111,7 @@ def extract_table_output(
             use_cache=use_cache,
             refresh_cache=refresh_cache,
             cache_extra_base=cache_extra,
+            force_check=bool(axis_delta),
         )
         orient_angle = (orient_angle + flip) % 360
         if axis_delta or flip:
@@ -125,6 +127,7 @@ def extract_table_output(
                 logger.warning("写入 OCR 缓存失败: %s", exc)
 
     text_boxes = postprocess_text_boxes(text_boxes)
+    text_boxes = fix_thin_glyphs(image, text_boxes)
 
     force = None if not tsr_kind or (tsr_kind or "").lower() == "auto" else tsr_kind
     tsr_result, _ = predict_table_html(

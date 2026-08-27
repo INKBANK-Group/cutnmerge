@@ -336,6 +336,28 @@ def looks_sideways(
     return False
 
 
+def _strong_ocr_sideways(
+    text_boxes: list,
+    *,
+    image: Optional[np.ndarray] = None,
+    angle_thresh: float = 70.0,
+    aspect_thresh: float = 0.25,
+) -> bool:
+    """
+    OCR 证据压倒性地表明整页侧躺：加权中位基线角接近 90° 且横长框占比极低。
+
+    用于豁免 has_strong_upright_wired_grid / 顶部题注 / 结构投票这三个否决。
+    那三个否决是为「表格直立、仅表头竖排字」设计的——那种情况下多数正文框仍横排，
+    加权中位基线角接近 0°、横长框占比很高；而整页侧躺时几乎每个框都竖排
+    （实测竖版专利表 baseline≈89°、aspect≈0.08，横版表 baseline=0°、aspect≈0.96）。
+    """
+    if len(text_boxes) < 8:
+        return False
+    if _weighted_median_baseline_angle(text_boxes, image=image) < angle_thresh:
+        return False
+    return _box_aspect_upright_ratio(text_boxes, image=image) <= aspect_thresh
+
+
 def ensure_upright_axis(
     image: np.ndarray,
     text_boxes: list,
@@ -362,13 +384,26 @@ def ensure_upright_axis(
     ih, iw = image.shape[:2]
     orig_landscape = iw > ih * 1.1
 
-    if has_strong_upright_wired_grid(image) and not grid_sideways:
+    # 整页侧躺时 OCR 基线角/框形状是最可靠的证据，不应被网格类启发式否决
+    strong_sideways = _strong_ocr_sideways(text_boxes, image=image)
+    if strong_sideways:
+        logger.info(
+            "方向轴向: OCR 证据压倒性侧躺（基线%.1f° aspect%.2f），豁免网格类否决",
+            _weighted_median_baseline_angle(text_boxes, image=image),
+            _box_aspect_upright_ratio(text_boxes, image=image),
+        )
+
+    if has_strong_upright_wired_grid(image) and not grid_sideways and not strong_sideways:
         logger.info(
             "方向轴向: 检测到直立有线网格，跳过 try90（避免竖排表头误转整图）"
         )
         return image, 0, text_boxes
 
-    if _caption_band_is_horizontal(text_boxes, image) and not grid_sideways:
+    if (
+        _caption_band_is_horizontal(text_boxes, image)
+        and not grid_sideways
+        and not strong_sideways
+    ):
         logger.info("方向轴向: 顶部题注水平，跳过 try90")
         return image, 0, text_boxes
 
@@ -376,7 +411,7 @@ def ensure_upright_axis(
     score90 = _structure_grid_score(
         rotate_image(image, 90), orig_landscape=orig_landscape
     )
-    if score0 >= score90 + 4.0 and not grid_sideways:
+    if score0 >= score90 + 4.0 and not grid_sideways and not strong_sideways:
         logger.info(
             "方向轴向: 结构投票保持 0° (grid0=%.1f grid90=%.1f)",
             score0,
@@ -431,7 +466,7 @@ def ensure_upright_axis(
 
     hs0, vs0 = _grid_line_strengths(image)
     hs90, vs90 = _grid_line_strengths(rotated)
-    if hs0 > 0.004 and vs0 > 0.003 and hs0 >= vs0 * 0.5:
+    if hs0 > 0.004 and vs0 > 0.003 and hs0 >= vs0 * 0.5 and not strong_sideways:
         if vs90 >= hs90 * 0.9 and q90 < q0 + 0.08:
             logger.info(
                 "方向轴向 OCR 比对: q0=%.3f q90=%.3f（网格惩罚，保持 0°）",
@@ -441,7 +476,7 @@ def ensure_upright_axis(
             return image, 0, text_boxes
 
     # 横版原图：提高采纳 90° 门槛
-    if orig_landscape and q90 <= q0 + 0.10 and not grid_sideways:
+    if orig_landscape and q90 <= q0 + 0.10 and not grid_sideways and not strong_sideways:
         logger.info(
             "方向轴向: 横版表 q90 优势不足，保持 0° (q0=%.3f q90=%.3f)",
             q0,
@@ -502,9 +537,14 @@ def maybe_flip_180_by_ocr(
     refresh_cache: bool = False,
     score_thresh: float = 0.55,
     cache_extra_base: str = "orient",
+    force_check: bool = False,
 ) -> Tuple[np.ndarray, int, list]:
     """
     根据已有 OCR 结果决定是否再转 180°；需要时重跑 OCR。
+
+    force_check: 上游刚做过 90° 轴向旋转时置 True。此时「转 90 还是 270」正是
+    未决问题，而倒置的中文仍可能拿到较高置信度（实测 0.919）并让下面两个
+    提前返回误判为「已正立」，因此必须实际跑一次 180° 比对。
 
     Returns:
         (image, added_180, text_boxes)
@@ -513,12 +553,16 @@ def maybe_flip_180_by_ocr(
 
     s0 = _mean_ocr_score(text_boxes)
     a0 = _box_aspect_upright_ratio(text_boxes, image=image)
-    if s0 >= score_thresh and a0 >= 0.55 and len(text_boxes) >= 8:
+    if not force_check and s0 >= score_thresh and a0 >= 0.55 and len(text_boxes) >= 8:
         logger.info("方向 180 消歧: keep score=%.3f aspect=%.3f", s0, a0)
         return image, 0, text_boxes
 
     ih, iw = image.shape[:2]
-    if iw > ih * 1.15 and _weighted_median_baseline_angle(text_boxes, image=image) <= 20.0:
+    if (
+        not force_check
+        and iw > ih * 1.15
+        and _weighted_median_baseline_angle(text_boxes, image=image) <= 20.0
+    ):
         logger.info("方向 180 消歧: 横版表基线水平，跳过 flip")
         return image, 0, text_boxes
 
@@ -585,6 +629,7 @@ def correct_orientation(
         refresh_cache=refresh_cache,
         score_thresh=score_thresh,
         cache_extra_base=f"orient_ax{angle}",
+        force_check=bool(axis_delta),
     )
     total = (angle + flip) % 360
     return image, total, boxes
