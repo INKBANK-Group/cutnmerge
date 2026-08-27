@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -15,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 # 文档建议：wired v2 对约 1500px 内效果最好；超过此长边等比缩小再推理
 _TSR_MAX_LONG_SIDE = 1500
+
+# 当 wired 网格被拓扑判定为非法（同一物理列被多个逻辑列占用，过切列）时，
+# 是否改用 OCR 几何重建表格。默认开；若批量回归发现误伤，可用环境变量关闭：
+#   CUTNMERGE_TSR_OCR_GRID_FALLBACK=0
+_OCR_GRID_FALLBACK = os.getenv("CUTNMERGE_TSR_OCR_GRID_FALLBACK", "1") not in {
+    "0",
+    "false",
+    "no",
+}
 
 _table_cls = None
 _wired_engine = None
@@ -66,6 +76,138 @@ def _classify_table(table_cls: Any, infer_image: np.ndarray) -> str:
     if label in {"wired", "wire", "有线"}:
         return "wired"
     return "lineless"
+
+
+def _cluster_centers_bands(
+    values,
+    *,
+    gap_factor: float = 1.5,
+    floor: float = 12.0,
+) -> List[float]:
+    """把一维中心值按自适应间距聚成若干带，返回各带中心。
+
+    间距阈值由相邻中心差的中位数导出（几何自适应，非内容魔法常数）；
+    floor 只用于压制亚像素噪声，避免把同一物理列的轻微抖动拆成两列。
+    """
+    xs = np.sort(np.asarray(list(values), dtype=np.float64))
+    if xs.size == 0:
+        return []
+    diffs = np.diff(xs)
+    med = float(np.median(diffs)) if diffs.size else 1.0
+    gap = max(floor, gap_factor * med)
+    groups = [[xs[0]]]
+    for x in xs[1:]:
+        if x - groups[-1][-1] <= gap:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    return [float(np.mean(g)) for g in groups]
+
+
+def _band_boundaries(centers: List[float]) -> List[float]:
+    """带中心 -> 相邻带中点作为分界（首尾用 ±inf）。"""
+    if not centers:
+        return []
+    bnd = [float("-inf")]
+    for a, b in zip(centers[:-1], centers[1:]):
+        bnd.append((a + b) / 2.0)
+    bnd.append(float("inf"))
+    return bnd
+
+
+def _band_index(v: float, boundaries: List[float]) -> int:
+    for i in range(len(boundaries) - 1):
+        if boundaries[i] <= v < boundaries[i + 1]:
+            return i
+    return len(boundaries) - 2
+
+
+def _physical_grid_is_valid(
+    cell_bboxes: np.ndarray,
+    logic_points: np.ndarray,
+    *,
+    gap_factor: float = 1.5,
+    floor: float = 12.0,
+) -> bool:
+    """纯几何判定 wired 网格是否拓扑合法。
+
+    同一物理列带内出现 ≥2 个不同逻辑列号 → 一张表不可能让两个逻辑列占用同一个
+    物理位置，故此网格自相矛盾（过切列/翻倍），视为非法，需走 OCR 几何重建。
+    正常表每个物理列带只对应一个逻辑列号，返回 True（零改动）。
+    """
+    from collections import defaultdict
+
+    cb = np.asarray(cell_bboxes, dtype=np.float64)
+    lp = np.asarray(logic_points, dtype=np.float64)
+    if cb.ndim == 2 and cb.shape[1] == 8:  # 引擎把 polygon 展平为 (N,8)
+        cb = cb.reshape(-1, 4, 2)
+    if cb.size == 0 or lp.size == 0 or cb.ndim != 3 or cb.shape[1] != 4:
+        return True
+    x_center = (cb[:, :, 0].min(1) + cb[:, :, 0].max(1)) / 2.0
+    centers = _cluster_centers_bands(x_center, gap_factor=gap_factor, floor=floor)
+    if len(centers) < 2:
+        return True
+    boundaries = _band_boundaries(centers)
+    per_band: Dict[int, set] = defaultdict(set)
+    col_start = lp[:, 2]  # 每格 col_start；用中心落入的带归组
+    for i, c in enumerate(x_center):
+        per_band[_band_index(float(c), boundaries)].add(int(col_start[i]))
+    for _, cols in per_band.items():
+        if len(cols) >= 2:
+            return False
+    return True
+
+
+def _rebuild_grid_from_ocr(
+    text_boxes: List[Dict[str, Any]],
+    *,
+    gap_factor: float = 1.5,
+    floor: float = 12.0,
+) -> str:
+    """用 OCR 文本位置重建行列并填字（无损：所用文字均来自 OCR，逐 token 含中心）。
+
+    仅用于 wired 网格被拓扑判定为非法的少数表；正常表不走此路径。
+    返回 <html><body><table>…</table></body></html>，由 wrap_pred_html 统一注入边框样式。
+    """
+    boxes = text_boxes or []
+    if not boxes:
+        return ""
+
+    def _center(tb: Dict[str, Any]) -> Tuple[float, float]:
+        p = np.asarray(tb.get("polygon"), dtype=np.float64).reshape(-1, 2)
+        if p.shape[0] < 4:
+            return float("nan"), float("nan")
+        return float(p[:, 0].mean()), float(p[:, 1].mean())
+
+    centers = [_center(tb) for tb in boxes]
+    xcs = [c[0] for c in centers if not np.isnan(c[0])]
+    ycs = [c[1] for c in centers if not np.isnan(c[1])]
+    xb = _cluster_centers_bands(xcs, gap_factor=gap_factor, floor=floor)
+    yb = _cluster_centers_bands(ycs, gap_factor=gap_factor, floor=floor)
+    if not xb or not yb:
+        return ""
+    xbnd = _band_boundaries(xb)
+    ybnd = _band_boundaries(yb)
+    R, C = len(yb), len(xb)
+    grid = [[""] * C for _ in range(R)]
+    for tb, (cx, cy) in zip(boxes, centers):
+        if np.isnan(cx) or np.isnan(cy):
+            continue
+        r = _band_index(float(cy), ybnd)
+        c = _band_index(float(cx), xbnd)
+        t = str(tb.get("text") or "").strip().replace("\n", " ")
+        if t:
+            grid[r][c] = (grid[r][c] + " " + t).strip()
+
+    parts = ["<html><body><table>"]
+    for r in range(R):
+        tds = []
+        for c in range(C):
+            cell = grid[r][c]
+            tds.append(f"<td>{cell}</td>" if cell else "<td></td>")
+        parts.append("<tr>" + "".join(tds) + "</tr>")
+    parts.append("</table></body></html>")
+    return "".join(parts)
 
 
 def _normalize_tsr_quad(poly: np.ndarray) -> List[List[float]]:
@@ -288,6 +430,22 @@ def predict_table_html(
     logger.info("TSR 路径: %s，ocr_boxes=%d", kind, len(ocr_result))
 
     result = _run_engine_with_ocr(engine, infer_img, ocr_result)
+
+    if kind == "wired" and _OCR_GRID_FALLBACK:
+        cb = getattr(result, "cell_bboxes", None)
+        lp = getattr(result, "logic_points", None)
+        if cb is not None and lp is not None:
+            try:
+                if not _physical_grid_is_valid(cb, lp):
+                    logger.warning(
+                        "wired 网格拓扑非法（同一物理列被多个逻辑列占用），改用 OCR 几何重建"
+                    )
+                    rebuilt = _rebuild_grid_from_ocr(text_boxes)
+                    if rebuilt:
+                        result.pred_html = rebuilt
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("网格拓扑校验/重建失败，保留原 wired 结果: %s", exc)
+
     elapse = getattr(result, "elapse", None)
     n_cells = 0
     cell_bboxes = getattr(result, "cell_bboxes", None)
