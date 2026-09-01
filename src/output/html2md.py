@@ -64,6 +64,7 @@ def table_to_markdown(table) -> str:
             origins.add((r_idx, c_idx))
 
             # 填充该单元格所覆盖的所有子坐标
+            # 填充网格
             for dr in range(rowspan):
                 for dc in range(colspan):
                     target_r = r_idx + dr
@@ -71,11 +72,12 @@ def table_to_markdown(table) -> str:
                     if dr == 0 and dc == 0:
                         grid[(target_r, target_c)] = text
                     else:
-                        # 若在表头区域，保留父级文本用于多级表头合并
-                        if target_r < header_depth:
+                        # 核心修改：如果是跨行（纵向合并），自动继承父级文本（向下填充）
+                        if dr > 0 and dc == 0:
+                            grid[(target_r, target_c)] = text
+                        elif target_r < header_depth:
                             grid[(target_r, target_c)] = text
                         else:
-                            # 数据体区域的跨列，其余位置填空
                             grid[(target_r, target_c)] = ""
 
             c_idx += colspan
